@@ -1,4 +1,16 @@
-import { DurableObject } from "cloudflare:workers";
+let DurableObjectBase;
+try {
+  const workers = await import("cloudflare:workers");
+  DurableObjectBase = workers.DurableObject;
+} catch (e) {
+  DurableObjectBase = class {
+    constructor(ctx, env) {
+      this.ctx = ctx;
+      this.env = env;
+    }
+  };
+}
+
 import { getMinuteWindow, getIranDayWindow, msUntilNextIranReset } from "./util.js";
 import {
   MAX_LOG_ROWS,
@@ -7,6 +19,8 @@ import {
   DEFAULT_KIND,
   MODEL_FAIL_THRESHOLD,
   MODEL_UNAVAILABLE_COOLDOWN_MS,
+  USAGE_STATE_FLUSH_INTERVAL_MS,
+  LOG_PRUNE_CHECK_INTERVAL,
 } from "./config.js";
 
 const SCHEMA = `
@@ -86,7 +100,7 @@ function rowsOf(cursor) {
   return cursor.toArray();
 }
 
-export class RouterDO extends DurableObject {
+export class RouterDO extends DurableObjectBase {
   constructor(ctx, env) {
     super(ctx, env);
     this.ctx = ctx;
@@ -104,7 +118,23 @@ export class RouterDO extends DurableObject {
           // had it) - expected and safe to ignore.
         }
       }
+      await this._reloadAllCaches();
+      const currentAlarm = await this.ctx.storage.getAlarm();
+      if (currentAlarm === null) {
+        await this.ctx.storage.setAlarm(Date.now() + USAGE_STATE_FLUSH_INTERVAL_MS);
+      }
     });
+  }
+
+  async _reloadAllCaches() {
+    this.modelsCache = rowsOf(this.ctx.storage.sql.exec(`SELECT * FROM models`));
+    this.keysCache = rowsOf(this.ctx.storage.sql.exec(`SELECT * FROM api_keys`));
+    this.usageState = new Map();
+    for (const row of rowsOf(this.ctx.storage.sql.exec(`SELECT * FROM usage_state`))) {
+      this.usageState.set(`${row.key_id}:${row.model_id}`, row);
+    }
+    const countRow = rowsOf(this.ctx.storage.sql.exec(`SELECT COUNT(*) as c FROM logs`))[0];
+    this.logCount = countRow ? countRow.c : 0;
   }
 
   // -------------------------------------------------------------------
@@ -112,32 +142,22 @@ export class RouterDO extends DurableObject {
   // -------------------------------------------------------------------
 
   _getOrInitUsageState(keyId, modelId, minuteWindow, dayWindow) {
-    const rows = rowsOf(
-      this.ctx.storage.sql.exec(
-        `SELECT * FROM usage_state WHERE key_id = ? AND model_id = ?`,
-        keyId,
-        modelId
-      )
-    );
-    if (rows.length) return rows[0];
-    this.ctx.storage.sql.exec(
-      `INSERT INTO usage_state (key_id, model_id, minute_window, minute_count, day_window, day_count, cooldown_until, last_used_at)
-       VALUES (?, ?, ?, 0, ?, 0, 0, 0)`,
-      keyId,
-      modelId,
-      minuteWindow,
-      dayWindow
-    );
-    return {
-      key_id: keyId,
-      model_id: modelId,
-      minute_window: minuteWindow,
-      minute_count: 0,
-      day_window: dayWindow,
-      day_count: 0,
-      cooldown_until: 0,
-      last_used_at: 0,
-    };
+    const cacheKey = `${keyId}:${modelId}`;
+    let state = this.usageState.get(cacheKey);
+    if (!state) {
+      state = {
+        key_id: keyId,
+        model_id: modelId,
+        minute_window: minuteWindow,
+        minute_count: 0,
+        day_window: dayWindow,
+        day_count: 0,
+        cooldown_until: 0,
+        last_used_at: 0
+      };
+      this.usageState.set(cacheKey, state);
+    }
+    return state;
   }
 
   _insertLog(entry) {
@@ -155,14 +175,25 @@ export class RouterDO extends DurableObject {
       entry.latencyMs ?? null,
       entry.errorMessage ? String(entry.errorMessage).slice(0, 800) : null
     );
-    const countRow = rowsOf(this.ctx.storage.sql.exec(`SELECT COUNT(*) as c FROM logs`))[0];
-    if (countRow && countRow.c > MAX_LOG_ROWS) {
-      const toDelete = countRow.c - MAX_LOG_ROWS;
-      this.ctx.storage.sql.exec(
-        `DELETE FROM logs WHERE id IN (SELECT id FROM logs ORDER BY id ASC LIMIT ?)`,
-        toDelete
-      );
+    this.logCount = (this.logCount || 0) + 1;
+    if (this.logCount % LOG_PRUNE_CHECK_INTERVAL === 0) {
+      const countRow = rowsOf(this.ctx.storage.sql.exec(`SELECT COUNT(*) as c FROM logs`))[0];
+      if (countRow && countRow.c > MAX_LOG_ROWS) {
+        const toDelete = countRow.c - MAX_LOG_ROWS;
+        this.ctx.storage.sql.exec(
+          `DELETE FROM logs WHERE id IN (SELECT id FROM logs ORDER BY id ASC LIMIT ?)`,
+          toDelete
+        );
+      }
     }
+  }
+
+  _cachedModelById(id) {
+    return this.modelsCache.find((m) => m.id === id);
+  }
+
+  _cachedKeyById(id) {
+    return this.keysCache.find((k) => k.id === id);
   }
 
   _modelByName(name) {
@@ -181,10 +212,22 @@ export class RouterDO extends DurableObject {
   // Model management (called from /admin/models)
   // -------------------------------------------------------------------
 
+  _upsertModelIntoCache(freshRow) {
+    const idx = this.modelsCache.findIndex((m) => m.id === freshRow.id);
+    if (idx === -1) this.modelsCache.push(freshRow);
+    else this.modelsCache[idx] = freshRow;
+  }
+
+  _upsertKeyIntoCache(freshRow) {
+    const idx = this.keysCache.findIndex((k) => k.id === freshRow.id);
+    if (idx === -1) this.keysCache.push(freshRow);
+    else this.keysCache[idx] = freshRow;
+  }
+
   async listModels() {
-    return rowsOf(
-      this.ctx.storage.sql.exec(`SELECT * FROM models ORDER BY order_num ASC, id ASC`)
-    ).map((m) => ({ ...m, enabled: !!m.enabled, thinking_levels: JSON.parse(m.thinking_levels) }));
+    return [...this.modelsCache]
+      .sort((a, b) => a.order_num - b.order_num || a.id - b.id)
+      .map((m) => ({ ...m, enabled: !!m.enabled, thinking_levels: JSON.parse(m.thinking_levels) }));
   }
 
   async addModel({
@@ -223,7 +266,9 @@ export class RouterDO extends DurableObject {
       now,
       now
     );
-    return this._modelByName(name);
+    const fresh = this._modelByName(name);
+    this._upsertModelIntoCache(fresh);
+    return fresh;
   }
 
   async updateModel(name, patch) {
@@ -252,7 +297,9 @@ export class RouterDO extends DurableObject {
       Date.now(),
       name
     );
-    return this._modelByName(name);
+    const fresh = this._modelByName(name);
+    this._upsertModelIntoCache(fresh);
+    return fresh;
   }
 
   /**
@@ -263,9 +310,7 @@ export class RouterDO extends DurableObject {
    * values happen to be (they don't need to be contiguous integers).
    */
   async swapModelOrder({ modelId, direction }) {
-    const models = rowsOf(
-      this.ctx.storage.sql.exec(`SELECT * FROM models ORDER BY order_num ASC, id ASC`)
-    );
+    const models = [...this.modelsCache].sort((a, b) => a.order_num - b.order_num || a.id - b.id);
     const idx = models.findIndex((m) => m.id === modelId);
     if (idx === -1) throw new Error(`model id ${modelId} not found`);
     const swapIdx = direction === "up" ? idx - 1 : idx + 1;
@@ -275,6 +320,11 @@ export class RouterDO extends DurableObject {
     const now = Date.now();
     this.ctx.storage.sql.exec(`UPDATE models SET order_num=?, updated_at=? WHERE id=?`, b.order_num, now, a.id);
     this.ctx.storage.sql.exec(`UPDATE models SET order_num=?, updated_at=? WHERE id=?`, a.order_num, now, b.id);
+    
+    const freshA = this._modelById(a.id);
+    const freshB = this._modelById(b.id);
+    this._upsertModelIntoCache(freshA);
+    this._upsertModelIntoCache(freshB);
     return { moved: true };
   }
 
@@ -283,6 +333,11 @@ export class RouterDO extends DurableObject {
     if (!existing) return { deleted: false };
     this.ctx.storage.sql.exec(`DELETE FROM usage_state WHERE model_id = ?`, existing.id);
     this.ctx.storage.sql.exec(`DELETE FROM models WHERE id = ?`, existing.id);
+    
+    this.modelsCache = this.modelsCache.filter((m) => m.id !== existing.id);
+    for (const k of this.usageState.keys()) {
+      if (k.endsWith(`:${existing.id}`)) this.usageState.delete(k);
+    }
     return { deleted: true };
   }
 
@@ -291,15 +346,16 @@ export class RouterDO extends DurableObject {
   // -------------------------------------------------------------------
 
   async listKeys({ reveal = false } = {}) {
-    const rows = rowsOf(this.ctx.storage.sql.exec(`SELECT * FROM api_keys ORDER BY id ASC`));
-    return rows.map((k) => ({
-      id: k.id,
-      label: k.label,
-      provider: k.provider,
-      enabled: !!k.enabled,
-      created_at: k.created_at,
-      api_key: reveal ? k.api_key : maskKey(k.api_key),
-    }));
+    return [...this.keysCache]
+      .sort((a, b) => a.id - b.id)
+      .map((k) => ({
+        id: k.id,
+        label: k.label,
+        provider: k.provider,
+        enabled: !!k.enabled,
+        created_at: k.created_at,
+        api_key: reveal ? k.api_key : maskKey(k.api_key),
+      }));
   }
 
   async addKey({ api_key, label, provider = DEFAULT_PROVIDER, enabled = true }) {
@@ -313,9 +369,16 @@ export class RouterDO extends DurableObject {
       enabled ? 1 : 0,
       Date.now()
     );
-    return rowsOf(
-      this.ctx.storage.sql.exec(`SELECT id, label, provider, enabled FROM api_keys WHERE api_key = ?`, api_key)
+    const fresh = rowsOf(
+      this.ctx.storage.sql.exec(`SELECT * FROM api_keys WHERE api_key = ?`, api_key)
     )[0];
+    this._upsertKeyIntoCache(fresh);
+    return {
+      id: fresh.id,
+      label: fresh.label,
+      provider: fresh.provider,
+      enabled: fresh.enabled,
+    };
   }
 
   async addKeysBulk(keys) {
@@ -339,12 +402,19 @@ export class RouterDO extends DurableObject {
       enabled ? 1 : 0,
       id
     );
-    return this._keyById(id);
+    const fresh = this._keyById(id);
+    this._upsertKeyIntoCache(fresh);
+    return fresh;
   }
 
   async deleteKey(id) {
     this.ctx.storage.sql.exec(`DELETE FROM usage_state WHERE key_id = ?`, id);
     this.ctx.storage.sql.exec(`DELETE FROM api_keys WHERE id = ?`, id);
+    
+    this.keysCache = this.keysCache.filter((k) => k.id !== id);
+    for (const k of this.usageState.keys()) {
+      if (k.startsWith(`${id}:`)) this.usageState.delete(k);
+    }
     return { deleted: true };
   }
 
@@ -367,12 +437,9 @@ export class RouterDO extends DurableObject {
     const dayWindow = getIranDayWindow(now);
     const excludeSet = new Set(excludePairs);
 
-    let models = rowsOf(
-      this.ctx.storage.sql.exec(
-        `SELECT * FROM models WHERE enabled = 1 AND kind = ? ORDER BY order_num ASC, id ASC`,
-        kind
-      )
-    );
+    let models = this.modelsCache
+      .filter((m) => m.enabled && m.kind === kind)
+      .sort((a, b) => a.order_num - b.order_num || a.id - b.id);
 
     if (requestedModel && requestedModel !== "auto") {
       const idx = models.findIndex((m) => m.name === requestedModel);
@@ -382,7 +449,7 @@ export class RouterDO extends DurableObject {
       }
     }
 
-    const keys = rowsOf(this.ctx.storage.sql.exec(`SELECT * FROM api_keys WHERE enabled = 1 ORDER BY id ASC`));
+    const keys = this.keysCache.filter((k) => k.enabled);
 
     for (const model of models) {
       if (excludeSet.has(`model:${model.id}`)) continue;
@@ -449,20 +516,20 @@ export class RouterDO extends DurableObject {
     const state = this._getOrInitUsageState(keyId, modelId, minuteWindow, dayWindow);
     const newMinuteCount = (state.minute_window === minuteWindow ? state.minute_count : 0) + 1;
     const newDayCount = (state.day_window === dayWindow ? state.day_count : 0) + 1;
-    this.ctx.storage.sql.exec(
-      `UPDATE usage_state SET minute_window=?, minute_count=?, day_window=?, day_count=?, last_used_at=? WHERE key_id=? AND model_id=?`,
-      minuteWindow,
-      newMinuteCount,
-      dayWindow,
-      newDayCount,
-      now,
-      keyId,
-      modelId
-    );
+    state.minute_window = minuteWindow;
+    state.minute_count = newMinuteCount;
+    state.day_window = dayWindow;
+    state.day_count = newDayCount;
+    state.last_used_at = now;
+
     // A success means the model has recovered - clear the circuit breaker.
-    this.ctx.storage.sql.exec(`UPDATE models SET fail_streak=0, unavailable_until=0 WHERE id=?`, modelId);
-    const model = this._modelById(modelId);
-    const key = this._keyById(keyId);
+    const model = this.modelsCache.find((m) => m.id === modelId);
+    if (model) {
+      model.fail_streak = 0;
+      model.unavailable_until = 0;
+    }
+
+    const key = this._cachedKeyById(keyId);
     this._insertLog({
       modelName: model?.name,
       keyLabel: key?.label,
@@ -491,25 +558,17 @@ export class RouterDO extends DurableObject {
     if (scope === "key") {
       const minuteWindow = getMinuteWindow(now);
       const dayWindow = getIranDayWindow(now);
-      this._getOrInitUsageState(keyId, modelId, minuteWindow, dayWindow);
+      const state = this._getOrInitUsageState(keyId, modelId, minuteWindow, dayWindow);
       const isDailyIssue = /day|daily|per[_ ]?day|resource_exhausted.*day/i.test(errorMessage || "");
       if (isDailyIssue) {
-        this.ctx.storage.sql.exec(
-          `UPDATE usage_state SET day_window=?, day_count=999999, cooldown_until=? WHERE key_id=? AND model_id=?`,
-          dayWindow,
-          now + msUntilNextIranReset(now),
-          keyId,
-          modelId
-        );
+        state.day_window = dayWindow;
+        state.day_count = 999999;
+        state.cooldown_until = now + msUntilNextIranReset(now);
       } else {
         const nextMinuteStart = (minuteWindow + 1) * 60000;
-        this.ctx.storage.sql.exec(
-          `UPDATE usage_state SET minute_window=?, minute_count=999999, cooldown_until=? WHERE key_id=? AND model_id=?`,
-          minuteWindow,
-          nextMinuteStart,
-          keyId,
-          modelId
-        );
+        state.minute_window = minuteWindow;
+        state.minute_count = 999999;
+        state.cooldown_until = nextMinuteStart;
       }
     } else if (scope === "model" && modelId) {
       // Circuit breaker: count consecutive model-level failures (502/503/
@@ -517,20 +576,19 @@ export class RouterDO extends DurableObject {
       // model out of rotation for MODEL_UNAVAILABLE_COOLDOWN_MS so future
       // requests skip it immediately instead of re-discovering the outage
       // via a fresh round trip every time.
-      const model = this._modelById(modelId);
-      const newStreak = (model?.fail_streak || 0) + 1;
-      if (newStreak >= MODEL_FAIL_THRESHOLD) {
-        this.ctx.storage.sql.exec(
-          `UPDATE models SET fail_streak=0, unavailable_until=? WHERE id=?`,
-          now + MODEL_UNAVAILABLE_COOLDOWN_MS,
-          modelId
-        );
-      } else {
-        this.ctx.storage.sql.exec(`UPDATE models SET fail_streak=? WHERE id=?`, newStreak, modelId);
+      const model = this.modelsCache.find((m) => m.id === modelId);
+      if (model) {
+        const newStreak = (model.fail_streak || 0) + 1;
+        if (newStreak >= MODEL_FAIL_THRESHOLD) {
+          model.fail_streak = 0;
+          model.unavailable_until = now + MODEL_UNAVAILABLE_COOLDOWN_MS;
+        } else {
+          model.fail_streak = newStreak;
+        }
       }
     }
-    const model = modelId ? this._modelById(modelId) : null;
-    const key = keyId ? this._keyById(keyId) : null;
+    const model = modelId ? this._cachedModelById(modelId) : null;
+    const key = keyId ? this._cachedKeyById(keyId) : null;
     this._insertLog({
       modelName: model?.name,
       keyLabel: key?.label,
@@ -549,10 +607,8 @@ export class RouterDO extends DurableObject {
     const now = Date.now();
     const minuteWindow = getMinuteWindow(now);
     const dayWindow = getIranDayWindow(now);
-    const models = rowsOf(this.ctx.storage.sql.exec(`SELECT * FROM models ORDER BY order_num ASC, id ASC`));
-    const keys = rowsOf(this.ctx.storage.sql.exec(`SELECT * FROM api_keys ORDER BY id ASC`));
-    const states = rowsOf(this.ctx.storage.sql.exec(`SELECT * FROM usage_state`));
-    const stateMap = new Map(states.map((s) => [`${s.key_id}:${s.model_id}`, s]));
+    const models = [...this.modelsCache].sort((a, b) => a.order_num - b.order_num || a.id - b.id);
+    const keys = [...this.keysCache].sort((a, b) => a.id - b.id);
 
     const result = models.map((model) => ({
       name: model.name,
@@ -573,7 +629,7 @@ export class RouterDO extends DurableObject {
       keys: keys
         .filter((key) => (key.provider || "google") === (model.provider || "google"))
         .map((key) => {
-          const st = stateMap.get(`${key.id}:${model.id}`);
+          const st = this.usageState.get(`${key.id}:${model.id}`);
           const minuteCount = st && st.minute_window === minuteWindow ? Math.min(st.minute_count, model.rpm) : 0;
           const dayCount = st && st.day_window === dayWindow ? Math.min(st.day_count, model.rpd) : 0;
           const cooldownUntil = st ? st.cooldown_until : 0;
@@ -650,11 +706,46 @@ export class RouterDO extends DurableObject {
   async rawQuery({ sql, params = [] }) {
     if (!sql || typeof sql !== "string") throw new Error("sql (string) is required");
     const cursor = this.ctx.storage.sql.exec(sql, ...params);
+    let result;
     try {
-      return { rows: rowsOf(cursor) };
+      result = { rows: rowsOf(cursor) };
     } catch {
-      return { ok: true, note: "Statement executed (no rows returned)." };
+      result = { ok: true, note: "Statement executed (no rows returned)." };
     }
+    await this._reloadAllCaches();
+    return result;
+  }
+
+  async _periodicFlush() {
+    for (const state of this.usageState.values()) {
+      this.ctx.storage.sql.exec(
+        `INSERT INTO usage_state (key_id, model_id, minute_window, minute_count, day_window, day_count, cooldown_until, last_used_at)
+         VALUES (?,?,?,?,?,?,?,?)
+         ON CONFLICT(key_id, model_id) DO UPDATE SET
+           minute_window=excluded.minute_window, minute_count=excluded.minute_count,
+           day_window=excluded.day_window, day_count=excluded.day_count,
+           cooldown_until=excluded.cooldown_until, last_used_at=excluded.last_used_at`,
+        state.key_id, state.model_id, state.minute_window, state.minute_count,
+        state.day_window, state.day_count, state.cooldown_until, state.last_used_at
+      );
+    }
+    for (const model of this.modelsCache) {
+      this.ctx.storage.sql.exec(
+        `UPDATE models SET fail_streak=?, unavailable_until=? WHERE id=?`,
+        model.fail_streak,
+        model.unavailable_until,
+        model.id
+      );
+    }
+  }
+
+  async alarm() {
+    try {
+      await this._periodicFlush();
+    } catch (err) {
+      this._insertLog({ status: "error", errorMessage: `periodic flush failed: ${err.message || err}` });
+    }
+    await this.ctx.storage.setAlarm(Date.now() + USAGE_STATE_FLUSH_INTERVAL_MS);
   }
 }
 

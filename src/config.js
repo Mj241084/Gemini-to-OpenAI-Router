@@ -120,3 +120,6 @@ export const SEED_KEYS = [
   "YOUR_GEMINI_API_KEY_2",
   "YOUR_GEMINI_API_KEY_3",
 ].map((key, i) => ({ api_key: key, label: `key-${i + 1}`, provider: "google" }));
+
+export const USAGE_STATE_FLUSH_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+export const LOG_PRUNE_CHECK_INTERVAL = 100;

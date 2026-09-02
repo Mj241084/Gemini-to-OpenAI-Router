@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "private": true,
   "description": "Cloudflare Worker: OpenAI-compatible router/load-balancer in front of Google AI Studio (Gemini) for use as a custom endpoint in Hermes Agent.",
+  "imports": {
+    "cloudflare:workers": "./tests/mockCloudflareWorkers.js"
+  },
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
