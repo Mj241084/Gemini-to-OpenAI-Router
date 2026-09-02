@@ -1,0 +1,8 @@
+# Copy this file to ".dev.vars" for local development with `wrangler dev`.
+# In production these are set with `wrangler secret put <NAME>`, NOT with this file.
+
+# Token Hermes Agent must send as "Authorization: Bearer <PROXY_TOKEN>"
+PROXY_TOKEN=change-me-proxy-token
+
+# Token you use for the /admin/* management endpoints
+ADMIN_TOKEN=change-me-admin-token

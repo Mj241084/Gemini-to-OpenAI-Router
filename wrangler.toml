@@ -1,0 +1,46 @@
+#:schema node_modules/wrangler/config-schema.json
+name = "gemini-hermes-router"
+main = "src/index.js"
+compatibility_date = "2026-08-01"
+
+# ---------------------------------------------------------------------------
+# Durable Object binding
+# ---------------------------------------------------------------------------
+# The "RouterDO" class holds all state: models, api keys, per (key, model)
+# usage counters, cooldowns and logs. It is backed by the SQLite storage
+# engine, which is the only storage backend allowed for Durable Objects on
+# the Cloudflare Workers Free plan.
+[[durable_objects.bindings]]
+name = "ROUTER_DO"
+class_name = "RouterDO"
+
+# The migration below is what actually provisions the class with the
+# "new_sqlite_classes" engine required by the Free plan. Do not rename this
+# tag once deployed - Cloudflare tracks migrations by tag, and renaming /
+# re-ordering them on a live worker can break the binding.
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RouterDO"]
+
+# ---------------------------------------------------------------------------
+# Non-secret configuration (safe to keep in this file / in git)
+# ---------------------------------------------------------------------------
+[vars]
+# Timezone used purely for logging/human-readable timestamps in /admin/status.
+# The actual daily-quota reset boundary (12:30 Iran time) is computed in
+# src/util.js regardless of this value.
+DISPLAY_TIMEZONE = "Asia/Tehran"
+
+# ---------------------------------------------------------------------------
+# Secrets (DO NOT put real values here - set them with `wrangler secret put`)
+# ---------------------------------------------------------------------------
+# PROXY_TOKEN            -> the bearer token Hermes must send to use /v1/chat/completions
+# ADMIN_TOKEN            -> the bearer token used for the /admin/* management endpoints
+# TELEGRAM_BOT_TOKEN     -> token from @BotFather (enables the Telegram admin bot)
+# TELEGRAM_OWNER_CHAT_ID -> your chat_id (from @userinfobot); the bot only replies to this chat
+# TELEGRAM_WEBHOOK_SECRET-> optional, verified via Telegram's secret_token header
+#
+# Real Gemini/AI Studio API keys are NOT stored as Worker secrets. They live
+# inside the Durable Object's SQLite database and are managed through the
+# /admin/keys endpoints (or the /admin/query passthrough), so you can add or
+# remove them at any time without redeploying the worker.
