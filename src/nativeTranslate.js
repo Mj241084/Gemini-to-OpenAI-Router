@@ -3,6 +3,30 @@
  * Handles translation between OpenAI-compatible format and Google's Native GenerateContent API format.
  */
 
+const toolsTranslationCache = new Map();
+const TOOLS_CACHE_MAX_ENTRIES = 50;
+
+/**
+ * Cache and translate tools declarations to avoid redundant uppercase transformations.
+ */
+export function translateToolsWithCache(tools) {
+  const cacheKey = JSON.stringify(tools);
+  const cached = toolsTranslationCache.get(cacheKey);
+  if (cached) return cached;
+  const functionDeclarations = tools
+    .filter((t) => t.type === "function" && t.function)
+    .map((t) => ({
+      name: t.function.name,
+      description: t.function.description || "",
+      parameters: uppercaseSchemaTypes(t.function.parameters)
+    }));
+  if (toolsTranslationCache.size >= TOOLS_CACHE_MAX_ENTRIES) {
+    toolsTranslationCache.clear();
+  }
+  toolsTranslationCache.set(cacheKey, functionDeclarations);
+  return functionDeclarations;
+}
+
 /**
  * Recursively converts schema property types to uppercase as required by Google's Native API.
  * e.g., "string" -> "STRING", "object" -> "OBJECT"
@@ -167,13 +191,7 @@ export function translateRequestToNative(openAiBody, { modelName, defaultThinkin
   // 2. Process Tools & Tool Choice
   // ---------------------------------------------------------------------------
   if (Array.isArray(openAiBody.tools) && openAiBody.tools.length > 0) {
-    const functionDeclarations = openAiBody.tools
-      .filter(t => t.type === "function" && t.function)
-      .map(t => ({
-        name: t.function.name,
-        description: t.function.description || "",
-        parameters: uppercaseSchemaTypes(t.function.parameters)
-      }));
+    const functionDeclarations = translateToolsWithCache(openAiBody.tools);
 
     if (functionDeclarations.length > 0) {
       nativeBody.tools = [{ functionDeclarations }];
