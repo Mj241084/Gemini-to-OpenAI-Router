@@ -1,5 +1,6 @@
 import { RouterDO } from "./routerDO.js";
 import { handleTelegramWebhook, sendOwnerAlert } from "./telegram.js";
+import { translateRequestToNative, translateNativeResponseToOpenAi } from "./nativeTranslate.js";
 import {
   PROVIDER_ENDPOINTS,
   MAX_ATTEMPTS,
@@ -143,6 +144,21 @@ async function handleChatCompletions(request, env, ctx) {
         // generateContent endpoint is the documented, stable way to do
         // Gemini TTS - see callGoogleNativeTts() below.
         upstreamResp = await callGoogleNativeTts(candidate, forwardBody);
+      } else if (candidate.provider === "google" && candidate.kind === "chat" && !body.stream) {
+        // Native path for non-streaming google chat completions
+        const { url, body: nativeBody } = translateRequestToNative(body, {
+          modelName: candidate.modelName,
+          defaultThinking: candidate.defaultThinking
+        });
+        upstreamResp = await fetch(url, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-goog-api-key": candidate.apiKey
+          },
+          body: JSON.stringify(nativeBody),
+          signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+        });
       } else {
         upstreamResp = await fetch(PROVIDER_ENDPOINTS[candidate.provider] || PROVIDER_ENDPOINTS.google, {
           method: "POST",
@@ -188,7 +204,7 @@ async function handleChatCompletions(request, env, ctx) {
     }
 
     // --- 502/503/504: model/upstream looks unavailable -> rotate model --
-    if ([502, 503, 504].includes(upstreamResp.status)) {
+    if ([502, 503, 504, 524].includes(upstreamResp.status)) {
       const errText = await safeReadText(upstreamResp);
       excludePairs.push(`model:${candidate.modelId}`);
       ctx.waitUntil(
@@ -280,12 +296,23 @@ async function handleChatCompletions(request, env, ctx) {
       return handleStreamingSuccess(upstreamResp, stub, candidate, latencyMs, ctx);
     }
 
-    const respText = await upstreamResp.text();
+    let respText = await upstreamResp.text();
     let usage = {};
-    try {
-      usage = JSON.parse(respText)?.usage || {};
-    } catch {
-      // non-JSON success body - forward as-is, just skip usage accounting
+    if (candidate.provider === "google" && candidate.kind === "chat" && !body.stream) {
+      try {
+        const nativeJson = JSON.parse(respText);
+        const openAiJson = translateNativeResponseToOpenAi(nativeJson, candidate.modelName);
+        respText = JSON.stringify(openAiJson);
+        usage = openAiJson.usage || {};
+      } catch (err) {
+        // fallback
+      }
+    } else {
+      try {
+        usage = JSON.parse(respText)?.usage || {};
+      } catch {
+        // non-JSON success body - forward as-is, just skip usage accounting
+      }
     }
     ctx.waitUntil(
       stub.reportSuccess({
@@ -415,7 +442,7 @@ async function handleEmbeddings(request, env, ctx) {
       continue;
     }
 
-    if ([502, 503, 504].includes(upstreamResp.status)) {
+    if ([502, 503, 504, 524].includes(upstreamResp.status)) {
       const errText = await safeReadText(upstreamResp);
       excludePairs.push(`model:${candidate.modelId}`);
       ctx.waitUntil(
