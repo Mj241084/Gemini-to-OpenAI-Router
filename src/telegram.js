@@ -97,7 +97,7 @@ const HELP_TEXT = `🤖 <b>Gemini Hermes Router — Bot مدیریت</b>
 <b>مشاهده‌ی وضعیت</b>
 /status — مصرف لحظه‌ای هر کلید روی هر مدل (rpm/rpd، cooldown)
 /models — لیست مدل‌ها با اولویت و ریت‌لیمیت
-/priority — تغییر اولویت مدل‌ها با دکمه‌های ⬆️⬇️
+/priority [mode] — تغییر اولویت مدل‌های متنی (با مقدار auto، fast یا stable)
 /keys — لیست کلیدها (ماسک‌شده)
 /logs [تعداد] [status] — لاگ‌های اخیر، مثال: <code>/logs 20 error</code>
 /stats [ساعت] — آمار تجمیعی، مثال: <code>/stats 24</code>
@@ -177,7 +177,8 @@ export async function handleTelegramWebhook(request, env, ctx, getStub) {
         await sendTelegramMessage(env, chatId, await formatModels(stub));
         break;
       case "/priority": {
-        const view = await buildPriorityView(stub);
+        const mode = args[0] && ["fast", "stable", "auto"].includes(args[0].toLowerCase()) ? args[0].toLowerCase() : "auto";
+        const view = await buildPriorityView(stub, mode);
         await sendTelegramMessageWithKeyboard(env, chatId, view.text, view.reply_markup);
         break;
       }
@@ -231,24 +232,38 @@ export async function handleTelegramWebhook(request, env, ctx, getStub) {
 // Inline-button priority reordering
 // ===========================================================================
 
-async function buildPriorityView(stub) {
-  const models = (await stub.listModels()).sort((a, b) => a.order_num - b.order_num);
+async function buildPriorityView(stub, mode = "auto") {
+  const normMode = mode.toLowerCase();
+  const orderCol = normMode === "fast" ? "order_fast" : normMode === "stable" ? "order_stable" : "order_num";
+  
+  // Exclude non-chat kinds (tts, embedding) and sort by the current mode's column
+  const models = (await stub.listModels())
+    .filter((m) => !m.kind || m.kind === "chat")
+    .sort((a, b) => (a[orderCol] ?? 100) - (b[orderCol] ?? 100) || a.id - b.id);
+
+  const modePersian = normMode === "fast" ? "سریع (Fast)" : normMode === "stable" ? "پایدار (Stable)" : "خودکار (Auto)";
+
   let text =
-    "🔀 <b>اولویت مدل‌ها</b>\nهرچی بالاتر باشه زودتر امتحان می‌شه. جابه‌جایی بین مدل‌های با kind متفاوت (chat/tts/embedding) بی‌اثره چون هرکدوم فقط با هم‌کیندهای خودشون رقابت می‌کنن، ولی برای وضوح این‌جا هم نشون داده می‌شه.\n\n";
+    `🔀 <b>اولویت مدل‌ها در حالت: ${modePersian}</b>\n` +
+    `هرچه بالاتر باشد زودتر امتحان می‌شود. برای تغییر حالت می‌توانید از این دستورها استفاده کنید:\n` +
+    `• <code>/priority auto</code>\n` +
+    `• <code>/priority fast</code>\n` +
+    `• <code>/priority stable</code>\n\n`;
+
   const keyboard = [];
   models.forEach((m, i) => {
     const badge = m.enabled ? "✅" : "⛔";
-    text += `${i + 1}. ${badge} ${escapeHtml(m.name)} [${escapeHtml(m.provider)}/${escapeHtml(m.kind || "chat")}]\n`;
+    text += `${i + 1}. ${badge} ${escapeHtml(m.name)} [${escapeHtml(m.provider)}]\n`;
     keyboard.push([
-      { text: i === 0 ? "▪️" : "⬆️", callback_data: i === 0 ? "noop" : `prio_up_${m.id}` },
+      { text: i === 0 ? "▪️" : "⬆️", callback_data: i === 0 ? "noop" : `prio_up_${m.id}_${normMode}` },
       { text: `${i + 1}. ${m.name}`.slice(0, 40), callback_data: "noop" },
       {
         text: i === models.length - 1 ? "▪️" : "⬇️",
-        callback_data: i === models.length - 1 ? "noop" : `prio_down_${m.id}`,
+        callback_data: i === models.length - 1 ? "noop" : `prio_down_${m.id}_${normMode}`,
       },
     ]);
   });
-  if (models.length === 0) text += "هیچ مدلی ثبت نشده.\n";
+  if (models.length === 0) text += "هیچ مدل متنی (chat) ثبت نشده است.\n";
   return { text: text.trim(), reply_markup: { inline_keyboard: keyboard } };
 }
 
@@ -269,13 +284,13 @@ async function handleCallbackQuery(callbackQuery, env, getStub) {
     return new Response("ok");
   }
 
-  const m = data.match(/^prio_(up|down)_(\d+)$/);
+  const m = data.match(/^prio_(up|down)_(\d+)_([a-z]+)$/);
   if (m && chatId && messageId) {
-    const [, direction, modelIdStr] = m;
+    const [, direction, modelIdStr, mode] = m;
     try {
-      const result = await stub.swapModelOrder({ modelId: Number(modelIdStr), direction });
+      const result = await stub.swapModelOrder({ modelId: Number(modelIdStr), direction, mode });
       await answerCallbackQuery(env, callbackQuery.id, result.moved ? "جابه‌جا شد ✅" : "همین‌جا ته صف/سر صفه");
-      const view = await buildPriorityView(stub);
+      const view = await buildPriorityView(stub, mode);
       await editTelegramMessage(env, chatId, messageId, view.text, view.reply_markup);
     } catch (e) {
       await answerCallbackQuery(env, callbackQuery.id, `خطا: ${String(e.message || e).slice(0, 180)}`);
@@ -299,7 +314,10 @@ async function formatStatus(stub) {
   if (s.models.length === 0) out += "هیچ مدلی ثبت نشده. از /seed یا /addmodel استفاده کن.\n";
   for (const m of s.models) {
     const cb = m.circuit_breaker || {};
-    out += `<b>${escapeHtml(m.name)}</b> [${escapeHtml(m.provider)}/${escapeHtml(m.kind || "chat")}] (order=${m.order}, ${m.enabled ? "فعال ✅" : "غیرفعال ⛔"})\nThinking پیش‌فرض: ${m.default_thinking ?? "-"}\n`;
+    const orders = m.kind === "chat" || !m.kind
+      ? `(order_auto=${m.order}, order_fast=${m.order_fast ?? 100}, order_stable=${m.order_stable ?? 100})`
+      : `(order=${m.order})`;
+    out += `<b>${escapeHtml(m.name)}</b> [${escapeHtml(m.provider)}/${escapeHtml(m.kind || "chat")}] ${orders} ${m.enabled ? "فعال ✅" : "غیرفعال ⛔"}\nThinking پیش‌فرض: ${m.default_thinking ?? "-"}\n`;
     if (cb.unavailable) {
       out += `  ⏸ مدل موقتاً کنار گذاشته شده (${cb.fail_streak} خطای پشت‌سرهم) — ${cb.unavailable_remaining_sec}s دیگه برمی‌گرده\n`;
     }
@@ -321,7 +339,10 @@ async function formatModels(stub) {
   let out = "📦 <b>مدل‌ها</b>\n\n";
   for (const m of models.sort((a, b) => a.order_num - b.order_num)) {
     out += `${m.enabled ? "✅" : "⛔"} <b>${escapeHtml(m.name)}</b> [${escapeHtml(m.provider || "google")}/${escapeHtml(m.kind || "chat")}]\n`;
-    out += `  order=${m.order_num} | rpm=${m.rpm} | rpd=${m.rpd}\n`;
+    const orders = m.kind === "chat" || !m.kind
+      ? `order_auto=${m.order_num} | order_fast=${m.order_fast ?? 100} | order_stable=${m.order_stable ?? 100}`
+      : `order=${m.order_num}`;
+    out += `  ${orders} | rpm=${m.rpm} | rpd=${m.rpd}\n`;
     out += `  thinking_levels=${m.thinking_levels.join(",") || "(none)"} | default=${m.default_thinking ?? "-"}\n`;
     if ((m.unavailable_until || 0) > Date.now()) {
       out += `  ⏸ در cooldown مدار قطع تا ${Math.ceil((m.unavailable_until - Date.now()) / 1000)}s دیگه\n`;

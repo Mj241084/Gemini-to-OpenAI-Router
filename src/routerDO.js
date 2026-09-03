@@ -30,6 +30,8 @@ CREATE TABLE IF NOT EXISTS models (
   provider TEXT NOT NULL DEFAULT 'google',
   kind TEXT NOT NULL DEFAULT 'chat',
   order_num INTEGER NOT NULL DEFAULT 100,
+  order_fast INTEGER NOT NULL DEFAULT 100,
+  order_stable INTEGER NOT NULL DEFAULT 100,
   rpm INTEGER NOT NULL,
   rpd INTEGER NOT NULL,
   thinking_levels TEXT NOT NULL DEFAULT '["minimal","low","medium","high"]',
@@ -88,6 +90,8 @@ CREATE INDEX IF NOT EXISTS idx_logs_ts ON logs(ts);
 const MIGRATIONS = [
   `ALTER TABLE models ADD COLUMN provider TEXT NOT NULL DEFAULT 'google'`,
   `ALTER TABLE models ADD COLUMN kind TEXT NOT NULL DEFAULT 'chat'`,
+  `ALTER TABLE models ADD COLUMN order_fast INTEGER NOT NULL DEFAULT 100`,
+  `ALTER TABLE models ADD COLUMN order_stable INTEGER NOT NULL DEFAULT 100`,
   `ALTER TABLE models ADD COLUMN fail_streak INTEGER NOT NULL DEFAULT 0`,
   `ALTER TABLE models ADD COLUMN unavailable_until INTEGER NOT NULL DEFAULT 0`,
   `ALTER TABLE api_keys ADD COLUMN provider TEXT NOT NULL DEFAULT 'google'`,
@@ -226,7 +230,6 @@ export class RouterDO extends DurableObjectBase {
 
   async listModels() {
     return [...this.modelsCache]
-      .sort((a, b) => a.order_num - b.order_num || a.id - b.id)
       .map((m) => ({ ...m, enabled: !!m.enabled, thinking_levels: JSON.parse(m.thinking_levels) }));
   }
 
@@ -235,6 +238,8 @@ export class RouterDO extends DurableObjectBase {
     provider = DEFAULT_PROVIDER,
     kind = DEFAULT_KIND,
     order = 100,
+    order_fast = 100,
+    order_stable = 100,
     rpm,
     rpd,
     thinking_levels,
@@ -248,16 +253,20 @@ export class RouterDO extends DurableObjectBase {
     const levels = Array.isArray(thinking_levels) ? thinking_levels : DEFAULT_THINKING_LEVELS;
     const now = Date.now();
     this.ctx.storage.sql.exec(
-      `INSERT INTO models (name, provider, kind, order_num, rpm, rpd, thinking_levels, default_thinking, enabled, created_at, updated_at)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?)
+      `INSERT INTO models (name, provider, kind, order_num, order_fast, order_stable, rpm, rpd, thinking_levels, default_thinking, enabled, created_at, updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
        ON CONFLICT(name) DO UPDATE SET
-         provider=excluded.provider, kind=excluded.kind, order_num=excluded.order_num, rpm=excluded.rpm, rpd=excluded.rpd,
+         provider=excluded.provider, kind=excluded.kind, order_num=excluded.order_num,
+         order_fast=excluded.order_fast, order_stable=excluded.order_stable,
+         rpm=excluded.rpm, rpd=excluded.rpd,
          thinking_levels=excluded.thinking_levels, default_thinking=excluded.default_thinking,
          enabled=excluded.enabled, updated_at=excluded.updated_at`,
       name,
       provider,
       kind,
       order,
+      order_fast ?? order ?? 100,
+      order_stable ?? order ?? 100,
       rpm,
       rpd,
       JSON.stringify(levels),
@@ -278,6 +287,8 @@ export class RouterDO extends DurableObjectBase {
       provider: patch.provider ?? existing.provider,
       kind: patch.kind ?? existing.kind,
       order: patch.order ?? existing.order_num,
+      order_fast: patch.order_fast ?? existing.order_fast ?? 100,
+      order_stable: patch.order_stable ?? existing.order_stable ?? 100,
       rpm: patch.rpm ?? existing.rpm,
       rpd: patch.rpd ?? existing.rpd,
       thinking_levels: patch.thinking_levels ?? JSON.parse(existing.thinking_levels),
@@ -285,10 +296,12 @@ export class RouterDO extends DurableObjectBase {
       enabled: patch.enabled ?? !!existing.enabled,
     };
     this.ctx.storage.sql.exec(
-      `UPDATE models SET provider=?, kind=?, order_num=?, rpm=?, rpd=?, thinking_levels=?, default_thinking=?, enabled=?, updated_at=? WHERE name=?`,
+      `UPDATE models SET provider=?, kind=?, order_num=?, order_fast=?, order_stable=?, rpm=?, rpd=?, thinking_levels=?, default_thinking=?, enabled=?, updated_at=? WHERE name=?`,
       merged.provider,
       merged.kind,
       merged.order,
+      merged.order_fast,
+      merged.order_stable,
       merged.rpm,
       merged.rpd,
       JSON.stringify(merged.thinking_levels),
@@ -303,14 +316,21 @@ export class RouterDO extends DurableObjectBase {
   }
 
   /**
-   * Moves a model one slot up or down in priority by swapping its order_num
-   * with its immediate neighbor in the currently sorted list. Used by the
-   * Telegram bot's inline-button /priority view - this way "up"/"down"
-   * always does something sensible regardless of what the raw order_num
-   * values happen to be (they don't need to be contiguous integers).
+   * Moves a model one slot up or down in priority by swapping its order column
+   * (order_num, order_fast, or order_stable) with its immediate neighbor
+   * in the currently sorted list for that mode and kind.
    */
-  async swapModelOrder({ modelId, direction }) {
-    const models = [...this.modelsCache].sort((a, b) => a.order_num - b.order_num || a.id - b.id);
+  async swapModelOrder({ modelId, direction, mode = "auto" }) {
+    const orderCol = mode === "fast" ? "order_fast" : mode === "stable" ? "order_stable" : "order_num";
+    const targetModel = this.modelsCache.find((m) => m.id === modelId);
+    if (!targetModel) throw new Error(`model id ${modelId} not found`);
+
+    // Only sort and swap among models of the same kind (e.g. chat models)
+    const targetKind = targetModel.kind || "chat";
+    const models = this.modelsCache
+      .filter((m) => (m.kind || "chat") === targetKind)
+      .sort((a, b) => (a[orderCol] ?? 100) - (b[orderCol] ?? 100) || a.id - b.id);
+
     const idx = models.findIndex((m) => m.id === modelId);
     if (idx === -1) throw new Error(`model id ${modelId} not found`);
     const swapIdx = direction === "up" ? idx - 1 : idx + 1;
@@ -318,8 +338,11 @@ export class RouterDO extends DurableObjectBase {
     const a = models[idx];
     const b = models[swapIdx];
     const now = Date.now();
-    this.ctx.storage.sql.exec(`UPDATE models SET order_num=?, updated_at=? WHERE id=?`, b.order_num, now, a.id);
-    this.ctx.storage.sql.exec(`UPDATE models SET order_num=?, updated_at=? WHERE id=?`, a.order_num, now, b.id);
+    const valA = a[orderCol] ?? 100;
+    const valB = b[orderCol] ?? 100;
+
+    this.ctx.storage.sql.exec(`UPDATE models SET ${orderCol}=?, updated_at=? WHERE id=?`, valB, now, a.id);
+    this.ctx.storage.sql.exec(`UPDATE models SET ${orderCol}=?, updated_at=? WHERE id=?`, valA, now, b.id);
     
     const freshA = this._modelById(a.id);
     const freshB = this._modelById(b.id);
@@ -437,11 +460,20 @@ export class RouterDO extends DurableObjectBase {
     const dayWindow = getIranDayWindow(now);
     const excludeSet = new Set(excludePairs);
 
+    const isModeRoute = requestedModel === "auto" || requestedModel === "fast" || requestedModel === "stable" || !requestedModel;
+    const mode = isModeRoute ? (requestedModel || "auto") : "auto";
+
+    const sortFn = (a, b) => {
+      if (mode === "fast") return (a.order_fast ?? 100) - (b.order_fast ?? 100) || a.id - b.id;
+      if (mode === "stable") return (a.order_stable ?? 100) - (b.order_stable ?? 100) || a.id - b.id;
+      return (a.order_num ?? 100) - (b.order_num ?? 100) || a.id - b.id;
+    };
+
     let models = this.modelsCache
       .filter((m) => m.enabled && m.kind === kind)
-      .sort((a, b) => a.order_num - b.order_num || a.id - b.id);
+      .sort(sortFn);
 
-    if (requestedModel && requestedModel !== "auto") {
+    if (!isModeRoute) {
       const idx = models.findIndex((m) => m.name === requestedModel);
       if (idx > 0) {
         const [m] = models.splice(idx, 1);
@@ -615,6 +647,8 @@ export class RouterDO extends DurableObjectBase {
       provider: model.provider || "google",
       kind: model.kind || "chat",
       order: model.order_num,
+      order_fast: model.order_fast,
+      order_stable: model.order_stable,
       enabled: !!model.enabled,
       rpm: model.rpm,
       rpd: model.rpd,

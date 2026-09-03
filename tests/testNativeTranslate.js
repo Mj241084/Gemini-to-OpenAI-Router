@@ -31,11 +31,15 @@ function runTests() {
   try {
     const inputSchema = {
       type: "object",
+      $schema: "http://json-schema.org/draft-07/schema",
+      additionalProperties: false,
+      const: "fixed_val",
       properties: {
         name: { type: "string" },
         age: { type: "integer" },
         tags: {
           type: "array",
+          additionalProperties: false,
           items: { type: "string" }
         }
       },
@@ -44,9 +48,13 @@ function runTests() {
 
     const outputSchema = uppercaseSchemaTypes(inputSchema);
     assert(outputSchema.type === "OBJECT", "Root schema type is OBJECT");
+    assert(!("additionalProperties" in outputSchema), "additionalProperties removed from root");
+    assert(!("$schema" in outputSchema), "$schema removed from root");
+    assert(!("const" in outputSchema), "const removed from root");
     assert(outputSchema.properties.name.type === "STRING", "Property name type is STRING");
     assert(outputSchema.properties.age.type === "INTEGER", "Property age type is INTEGER");
     assert(outputSchema.properties.tags.type === "ARRAY", "Property tags type is ARRAY");
+    assert(!("additionalProperties" in outputSchema.properties.tags), "additionalProperties removed from nested property");
     assert(outputSchema.properties.tags.items.type === "STRING", "Array items type is STRING");
   } catch (err) {
     console.error("Test 1 crashed:", err);

@@ -58,6 +58,8 @@ export default {
           .filter((m) => m.enabled)
           .sort((a, b) => a.order_num - b.order_num)
           .map((m) => ({ id: m.name, object: "model", owned_by: "google-ai-studio" }));
+        data.unshift({ id: "stable", object: "model", owned_by: "gemini-hermes-router" });
+        data.unshift({ id: "fast", object: "model", owned_by: "gemini-hermes-router" });
         data.unshift({ id: "auto", object: "model", owned_by: "gemini-hermes-router" });
         return withCors(json({ object: "list", data }));
       }

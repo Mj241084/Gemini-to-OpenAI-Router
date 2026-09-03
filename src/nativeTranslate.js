@@ -27,13 +27,59 @@ export function translateToolsWithCache(tools) {
   return functionDeclarations;
 }
 
-/**
- * Recursively converts schema property types to uppercase as required by Google's Native API.
- * e.g., "string" -> "STRING", "object" -> "OBJECT"
- */
+// Google's native Schema object (used in both functionDeclarations[].parameters
+// and generationConfig.responseSchema) is a curated, LIMITED subset of OpenAPI
+// 3.0/JSON Schema - it does NOT accept every keyword that OpenAI-shaped tool/
+// schema generators commonly emit. The previous version of this function only
+// transformed `type`/`properties`/`items` and passed every other key through
+// unchanged via a shallow `{ ...schema }` copy - this let stray keywords like
+// `additionalProperties` (which OpenAI's own "strict" json_schema mode, and many
+// Zod/Pydantic-to-JSON-Schema converters, add automatically to every object
+// schema) reach Google's API untouched, producing a hard 400:
+//   "Unknown name \"additionalProperties\" at '...': Cannot find field."
+// This is a STRUCTURAL bug, not a one-off: it fires deterministically on every
+// request whose schema (tool parameters OR response_format.json_schema) happens
+// to include one of these fields, for as long as the caller's schema generator
+// keeps emitting them.
+//
+// Confidence levels (see nativeTranslate test file / router README for details):
+//   - "additionalProperties": CONFIRMED via a live 400 (see error text above).
+//   - everything else below: not yet triggered in production, but near-certain
+//     to cause the identical class of error if they ever show up, because
+//     they're JSON-Schema-Draft keywords (schema referencing, pattern-keyed
+//     properties, content-encoding hints, etc.) that go beyond even the full
+//     OpenAPI 3.0 spec Gemini claims to subset - stripping them is low-risk
+//     (worst case: a purely cosmetic/validation hint is dropped) versus the
+//     alternative (another blind 400).
+//
+// Google's error format is self-diagnosing ("Unknown name \"X\" at '...'"), so
+// if a NEW unsupported field shows up later, the fix is a one-line addition to
+// this array - no need to get the list perfect up front.
+const UNSUPPORTED_SCHEMA_KEYS = [
+  "additionalProperties", // confirmed via live 400
+  "$schema",
+  "$id",
+  "$ref",
+  "$defs",
+  "definitions",
+  "unevaluatedProperties",
+  "unevaluatedItems",
+  "patternProperties",
+  "additionalItems",
+  "const",
+  "contentEncoding",
+  "contentMediaType",
+  "examples",
+];
+
 export function uppercaseSchemaTypes(schema) {
   if (!schema || typeof schema !== "object") return schema;
   const copy = { ...schema };
+
+  for (const key of UNSUPPORTED_SCHEMA_KEYS) {
+    delete copy[key];
+  }
+
   if (typeof copy.type === "string") {
     copy.type = copy.type.toUpperCase();
   }
@@ -47,6 +93,19 @@ export function uppercaseSchemaTypes(schema) {
   if (copy.items && typeof copy.items === "object") {
     copy.items = uppercaseSchemaTypes(copy.items);
   }
+
+  // NOT YET HANDLED / NOT LIVE-TESTED: `anyOf` / `oneOf` / `allOf` (JSON-Schema
+  // union composition - commonly emitted for Optional[...]/nullable fields by
+  // Pydantic v2 and some Zod converters as e.g. `anyOf: [{type:"string"},
+  // {type:"null"}]`). Whether this specific Gemini API version's Schema object
+  // supports `anyOf` at all is genuinely unconfirmed here. If a future 400
+  // mentions "anyOf"/"oneOf"/"allOf" in the field path, that is the signal to
+  // live-test the exact accepted shape (same methodology used to confirm the
+  // additionalProperties fix) before writing translation logic for it - for
+  // now these keys pass through UNCHANGED if present, which means any nested
+  // `type` values inside them stay lowercase and could trigger a *different*
+  // 400 on their own.
+
   return copy;
 }
 

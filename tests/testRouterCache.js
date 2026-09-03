@@ -94,6 +94,8 @@ async function runTests() {
       provider: "google",
       kind: "chat",
       order: 1,
+      order_fast: 2,
+      order_stable: 1,
       rpm: 5,
       rpd: 20
     });
@@ -103,6 +105,8 @@ async function runTests() {
       provider: "google",
       kind: "chat",
       order: 2,
+      order_fast: 1,
+      order_stable: 2,
       rpm: 5,
       rpd: 20
     });
@@ -271,6 +275,65 @@ async function runTests() {
     assert(candidate === null, "pickCandidate immediately skips the cooling-down model before periodic flush");
   } catch (err) {
     console.error("Test 6 failed:", err);
+    failed++;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 7: Multi-Routing Modes Selection (Sec 3.3)
+  // ---------------------------------------------------------------------------
+  try {
+    console.log("\n--- Test 7: Multi-Routing Modes Selection ---");
+    
+    // Reset circuit breakers and make sure all are enabled (and that gemini-3.5-flash is present and has id=1)
+    await router.rawQuery({ sql: "UPDATE models SET unavailable_until = 0, fail_streak = 0, enabled = 1" });
+
+    // Since Test 1 deletes gemini-3.6-flash, let's clear the entire cache and tables and recreate fresh for Test 7
+    await router.rawQuery({ sql: "DELETE FROM models" });
+
+    await router.addModel({
+      name: "gemini-3.5-flash",
+      provider: "google",
+      kind: "chat",
+      order: 1,
+      order_fast: 2,
+      order_stable: 1,
+      rpm: 5,
+      rpd: 20
+    });
+
+    await router.addModel({
+      name: "gemini-3.6-flash",
+      provider: "google",
+      kind: "chat",
+      order: 2,
+      order_fast: 1,
+      order_stable: 2,
+      rpm: 5,
+      rpd: 20
+    });
+
+    // Pick for "fast" mode (where gemini-3.6-flash has order_fast=1, gemini-3.5-flash has order_fast=2)
+    const fastCandidate = await router.pickCandidate({ requestedModel: "fast" });
+    assert(fastCandidate !== null && fastCandidate.modelName === "gemini-3.6-flash", "fast mode picks gemini-3.6-flash first");
+
+    // Pick for "stable" mode (where gemini-3.5-flash has order_stable=1, gemini-3.6-flash has order_stable=2)
+    const stableCandidate = await router.pickCandidate({ requestedModel: "stable" });
+    assert(stableCandidate !== null && stableCandidate.modelName === "gemini-3.5-flash", "stable mode picks gemini-3.5-flash first");
+
+    // Pick for "auto" mode (where gemini-3.5-flash has order_num=1, gemini-3.6-flash has order_num=2)
+    const autoCandidate = await router.pickCandidate({ requestedModel: "auto" });
+    assert(autoCandidate !== null && autoCandidate.modelName === "gemini-3.5-flash", "auto mode picks gemini-3.5-flash first");
+
+    // Swap order_fast
+    const targetModel = router.modelsCache.find(m => m.name === "gemini-3.6-flash");
+    await router.swapModelOrder({ modelId: targetModel.id, direction: "down", mode: "fast" });
+
+    // Ensure state is updated/synchronized
+    const fastCandidate2 = await router.pickCandidate({ requestedModel: "fast" });
+    assert(fastCandidate2 !== null && fastCandidate2.modelName === "gemini-3.5-flash", "after swapping order_fast, fast mode picks gemini-3.5-flash");
+
+  } catch (err) {
+    console.error("Test 7 failed:", err);
     failed++;
   }
 
