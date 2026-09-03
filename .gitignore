@@ -33,3 +33,7 @@ Thumbs.db
 # Temporary / Archives
 Router.zip
 
+# API keys & Backups
+keys.txt
+*backup*.json
+tests/seed_canary.py
