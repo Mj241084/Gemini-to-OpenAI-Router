@@ -143,10 +143,7 @@ export function translateRequestToNative(openAiBody, { modelName, defaultThinkin
         continue;
       }
 
-      const nativeContent = {
-        role: msg.role === "assistant" ? "model" : "user",
-        parts: []
-      };
+      const role = msg.role === "assistant" ? "model" : "user";
 
       if (msg.role === "tool") {
         // Map OpenAI tool result to user functionResponse part
@@ -160,42 +157,32 @@ export function translateRequestToNative(openAiBody, { modelName, defaultThinkin
           parsedContent = { result: msg.content };
         }
 
-        nativeContent.parts.push({
+        const funcRespPart = {
           functionResponse: {
             name: msg.name,
             response: parsedContent,
             id: msg.tool_call_id
           }
-        });
-        contents.push(nativeContent);
+        };
+
+        const lastContent = contents[contents.length - 1];
+        if (lastContent && lastContent.role === "user") {
+          lastContent.parts.push(funcRespPart);
+        } else {
+          contents.push({
+            role: "user",
+            parts: [funcRespPart]
+          });
+        }
         continue;
       }
 
-      // Map normal content or assistant tool_calls
-      if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
-        for (const call of msg.tool_calls) {
-          let args = {};
-          try {
-            args = typeof call.function.arguments === "string" ? JSON.parse(call.function.arguments) : (call.function.arguments || {});
-          } catch (e) {
-            args = { raw_arguments: call.function.arguments };
-          }
+      const nativeContent = {
+        role,
+        parts: []
+      };
 
-          // Extract thought signature or use sentinel
-          const existingSig = call.extra_content?.google?.thought_signature;
-          const sig = (typeof existingSig === "string" && existingSig.length > 0) ? existingSig : "context_engineering_is_the_way_to_go";
-
-          nativeContent.parts.push({
-            functionCall: {
-              name: call.function.name,
-              args: args,
-              id: call.id
-            },
-            thoughtSignature: sig
-          });
-        }
-      }
-
+      // Map normal content FIRST (text/images/audio must come BEFORE functionCall in Gemini parts)
       if (typeof msg.content === "string" && msg.content.length > 0) {
         nativeContent.parts.push({ text: msg.content });
       } else if (Array.isArray(msg.content)) {
@@ -232,10 +219,50 @@ export function translateRequestToNative(openAiBody, { modelName, defaultThinkin
         }
       }
 
+      // Map assistant tool_calls AFTER content parts
+      if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) {
+        for (const call of msg.tool_calls) {
+          let args = {};
+          try {
+            args = typeof call.function.arguments === "string" ? JSON.parse(call.function.arguments) : (call.function.arguments || {});
+          } catch (e) {
+            args = { raw_arguments: call.function.arguments };
+          }
+
+          // Extract thought signature or use sentinel
+          const existingSig = call.extra_content?.google?.thought_signature;
+          const sig = (typeof existingSig === "string" && existingSig.length > 0) ? existingSig : "context_engineering_is_the_way_to_go";
+
+          nativeContent.parts.push({
+            functionCall: {
+              name: call.function.name,
+              args: args,
+              id: call.id
+            },
+            thoughtSignature: sig
+          });
+        }
+      }
+
       if (nativeContent.parts.length > 0) {
-        contents.push(nativeContent);
+        const lastContent = contents[contents.length - 1];
+        if (lastContent && lastContent.role === nativeContent.role) {
+          lastContent.parts.push(...nativeContent.parts);
+        } else {
+          contents.push(nativeContent);
+        }
       }
     }
+  }
+
+  // Gemini Native API Validation Rules:
+  // 1. The FIRST entry in contents MUST have role: "user".
+  //    If history begins with a model turn (e.g. proactive_wake or assistant initiation), prepend a dummy user turn.
+  if (contents.length > 0 && contents[0].role === "model") {
+    contents.unshift({
+      role: "user",
+      parts: [{ text: "..." }]
+    });
   }
 
   nativeBody.contents = contents;

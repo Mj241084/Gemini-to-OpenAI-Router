@@ -205,8 +205,17 @@ async function handleChatCompletions(request, env, ctx) {
       continue;
     }
 
-    // --- 502/503/504: model/upstream looks unavailable -> rotate model --
-    if ([502, 503, 504, 524].includes(upstreamResp.status)) {
+    // --- 502/503/504/524، یا 500 با status:"INTERNAL"/"UNAVAILABLE" در بدنه
+    // (خطای موقت خود گوگل - قبلاً بدون retry مستقیم به caller می‌رفت) -> کل
+    // مدل کنار گذاشته می‌شه، مدل بعدی امتحان می‌شه.
+    //
+    // نکته‌ی فنی: بدنه‌ی یک Response فقط یک‌بار قابل خوندنه، پس برای چک
+    // کردن محتوای یک 500 (بدون این‌که بدنه رو "مصرف" کنیم و شاخه‌های بعدی
+    // با مشکل مواجه بشن) از resp.clone() استفاده می‌کنیم.
+    const isTransient500 =
+      upstreamResp.status === 500 && (await isTransientGoogleError(upstreamResp.clone()));
+
+    if ([502, 503, 504, 524].includes(upstreamResp.status) || isTransient500) {
       const errText = await safeReadText(upstreamResp);
       excludePairs.push(`model:${candidate.modelId}`);
       ctx.waitUntil(
@@ -910,4 +919,8 @@ async function readJson(request) {
   } catch {
     return {};
   }
+}
+async function isTransientGoogleError(respClone) {
+  const text = await safeReadText(respClone);
+  return /"status"\s*:\s*"(INTERNAL|UNAVAILABLE)"/i.test(text);
 }

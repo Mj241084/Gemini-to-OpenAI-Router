@@ -164,10 +164,11 @@ function runTests() {
     // Assistant tool_call translation
     const assistantMsg = result.body.contents[1];
     assert(assistantMsg.role === "model", "Assistant message role maps to model");
-    assert(assistantMsg.parts[0].functionCall.name === "get_weather", "Assistant part 1 is functionCall 'get_weather'");
-    assert(assistantMsg.parts[0].functionCall.id === "call_999", "Assistant functionCall carries correct ID");
-    assert(assistantMsg.parts[0].functionCall.args.location === "Tehran", "Assistant functionCall arguments are fully parsed");
-    assert(assistantMsg.parts[0].thoughtSignature === "context_engineering_is_the_way_to_go", "Missing thought_signature correctly injected with sentinel");
+    const funcCallPart = assistantMsg.parts.find(p => p.functionCall);
+    assert(funcCallPart && funcCallPart.functionCall.name === "get_weather", "Assistant part has functionCall 'get_weather'");
+    assert(funcCallPart.functionCall.id === "call_999", "Assistant functionCall carries correct ID");
+    assert(funcCallPart.functionCall.args.location === "Tehran", "Assistant functionCall arguments are fully parsed");
+    assert(funcCallPart.thoughtSignature === "context_engineering_is_the_way_to_go", "Missing thought_signature correctly injected with sentinel");
 
     // Tool response translation
     const toolMsg = result.body.contents[2];
