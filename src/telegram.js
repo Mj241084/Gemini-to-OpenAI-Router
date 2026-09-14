@@ -97,19 +97,11 @@ const HELP_TEXT = `🤖 <b>Gemini Hermes Router — Bot مدیریت</b>
 <b>مشاهده‌ی وضعیت</b>
 /status — مصرف لحظه‌ای هر کلید روی هر مدل (rpm/rpd، cooldown)
 /models — لیست مدل‌ها با اولویت و ریت‌لیمیت
-/priority [mode] — تغییر اولویت مدل‌های متنی (با مقدار auto، fast یا stable)
+/setprio &lt;name&gt; &lt;order&gt; [mode=auto|fast|stable] — تغییر مستقیم اولویت/ترتیب یک مدل
+مثال: <code>/setprio gemini-4-flash 1 fast</code>
 /keys — لیست کلیدها (ماسک‌شده)
 /logs [تعداد] [status] — لاگ‌های اخیر، مثال: <code>/logs 20 error</code>
 /stats [ساعت] — آمار تجمیعی، مثال: <code>/stats 24</code>
-
-<b>افزودن</b>
-/addmodel &lt;name&gt; &lt;order&gt; &lt;rpm&gt; &lt;rpd&gt; [levels_csv|none] [default] [provider=openrouter]
-مثال (گوگل، پیش‌فرض):
-<code>/addmodel gemini-4-flash 4 5 20 minimal,low,medium,high high</code>
-مثال (OpenRouter):
-<code>/addmodel meta-llama/llama-3.3-70b-instruct:free 9 20 200 none provider=openrouter</code>
-
-/addkey &lt;api_key&gt; [label] [provider=openrouter]
 مثال:
 <code>/addkey AQ.xxxxxxxxxxxxxxxxxxxx key-6</code>
 <code>/addkey sk-or-v1-xxxxxxxxxxxx or-key-1 provider=openrouter</code>
@@ -176,12 +168,6 @@ export async function handleTelegramWebhook(request, env, ctx, getStub) {
       case "/models":
         await sendTelegramMessage(env, chatId, await formatModels(stub));
         break;
-      case "/priority": {
-        const mode = args[0] && ["fast", "stable", "auto"].includes(args[0].toLowerCase()) ? args[0].toLowerCase() : "auto";
-        const view = await buildPriorityView(stub, mode);
-        await sendTelegramMessageWithKeyboard(env, chatId, view.text, view.reply_markup);
-        break;
-      }
       case "/keys":
         await sendTelegramMessage(env, chatId, await formatKeys(stub));
         break;
@@ -193,6 +179,9 @@ export async function handleTelegramWebhook(request, env, ctx, getStub) {
         break;
       case "/addmodel":
         await sendTelegramMessage(env, chatId, await cmdAddModel(stub, args));
+        break;
+      case "/setprio":
+        await sendTelegramMessage(env, chatId, await cmdSetPrio(stub, args));
         break;
       case "/addkey":
         await sendTelegramMessage(env, chatId, await cmdAddKey(stub, args));
@@ -431,6 +420,22 @@ async function cmdAddModel(stub, args) {
     kind: kv.kind,
   });
   return `✅ مدل ثبت شد: <b>${escapeHtml(model.name)}</b> [${escapeHtml(model.provider)}/${escapeHtml(model.kind)}] | order=${model.order_num} | rpm=${model.rpm} | rpd=${model.rpd}`;
+}
+
+async function cmdSetPrio(stub, args) {
+  const [name, orderStr, mode = "auto"] = args;
+  if (!name || !orderStr || Number.isNaN(Number(orderStr))) {
+    return "فرمت درست:\n<code>/setprio &lt;name&gt; &lt;order&gt; [mode=auto|fast|stable]</code>\nمثال: <code>/setprio gemini-4-flash 1 fast</code>";
+  }
+  const orderVal = Number(orderStr);
+  const normMode = mode.toLowerCase();
+  const patch = {};
+  if (normMode === "fast") patch.order_fast = orderVal;
+  else if (normMode === "stable") patch.order_stable = orderVal;
+  else patch.order = orderVal;
+
+  await stub.updateModel(name, patch);
+  return `✅ اولویت مدل <b>${escapeHtml(name)}</b> در حالت <b>${escapeHtml(normMode)}</b> به <b>${orderVal}</b> تغییر یافت.`;
 }
 
 async function cmdAddKey(stub, args) {
