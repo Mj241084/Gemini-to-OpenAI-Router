@@ -1,0 +1,23 @@
+#:schema node_modules/wrangler/config-schema.json
+# Isolated test deployment for the Anthropic-bridge feature branch. Separate
+# worker name = separate Durable Object storage = safe to seed/break without
+# touching production (gemini-hermes-router) state or quotas.
+name = "google2anthropic"
+main = "src/index.js"
+compatibility_date = "2026-08-01"
+
+[[durable_objects.bindings]]
+name = "ROUTER_DO"
+class_name = "RouterDO"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RouterDO"]
+
+[vars]
+DISPLAY_TIMEZONE = "Asia/Tehran"
+
+# Secrets (set separately via `wrangler secret put ... --config wrangler.test.toml`):
+# PROXY_TOKEN, ADMIN_TOKEN. Real Gemini API keys go through /admin/keys, same
+# as production — this worker's DO starts empty, so it needs its own /admin/seed
+# or /admin/keys calls.

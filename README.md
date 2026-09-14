@@ -269,6 +269,44 @@ model:    auto   # یا اسم دقیق یک مدل - در هر دو حالت fa
 
 ---
 
+## ۶.۱) اتصال از Anthropic Messages API و Claude Code
+
+این روتر علاوه بر لایه‌ی سازگار با OpenAI، از استاندارد **Anthropic Messages API** نیز پشتیبانی کامل می‌کند:
+- `POST /v1/messages`: پشتیبانی کامل از هر دو حالت non-streaming و streaming (رویدادهای SSE استاندارد Anthropic).
+- `POST /v1/messages/count_tokens`: محاسبه‌ی سریع تعداد توکن‌های پرامپت با اتصال مستقیم به `:countTokens` بومی گوگل.
+- احراز هویت با هدر `x-api-key: <PROXY_TOKEN>` یا `Authorization: Bearer <PROXY_TOKEN>`.
+- مدیریت خودکار امضای تفکر Gemini 3 (`thoughtSignature`) در هر دو حالت استریم و غیر-استریم برای مکالمات چندمرحله‌ای ابزار (Multi-turn Tool Use).
+
+### اتصال Claude Code به روتر
+
+قبل از اجرای `claude` متغیرهای زیر را تنظیم کن (نکته‌ی حیاتی: `ANTHROPIC_API_KEY=""` باید صریحاً خالی گذاشته شود تا کلاینت به سراغ لاگین رسمی نرود):
+
+```bash
+export ANTHROPIC_BASE_URL="https://<your-worker>.workers.dev"
+export ANTHROPIC_AUTH_TOKEN="<همون مقدار PROXY_TOKEN>"
+export ANTHROPIC_API_KEY=""
+export ANTHROPIC_MODEL="auto"
+export ANTHROPIC_SMALL_FAST_MODEL="fast"
+
+claude
+```
+
+برای دائمی کردن این تنظیمات در سیستم، فایل `~/.claude/settings.json` را باز یا ایجاد کرده و بخش `env` را اضافه کن:
+
+```json
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://<your-worker>.workers.dev",
+    "ANTHROPIC_AUTH_TOKEN": "<همون مقدار PROXY_TOKEN>",
+    "ANTHROPIC_API_KEY": "",
+    "ANTHROPIC_MODEL": "auto",
+    "ANTHROPIC_SMALL_FAST_MODEL": "fast"
+  }
+}
+```
+
+---
+
 ## ۷) TTS — چرا از مسیر بومی گوگل رد می‌شه
 
 نسخه‌ی اول این پروژه TTS رو از همون لایه‌ی OpenAI-compat (`modalities: ["text","audio"]`)
@@ -422,7 +460,7 @@ overwrite کنه. نیازی به کار اضافه نیست.
 - بازه‌ی ریست روزانه (۱۲:۳۰ ظهر ایران) در `getIranDayWindow` قابل ویرایشه اگه سهمیه‌ی
   واقعی گوگل زمان دیگه‌ای ریست بشه.
 - روی خطای ۴۰۰، Worker عمداً retry نمی‌کنه.
-- فقط `/v1/chat/completions`، `/v1/embeddings` و `/v1/models` پیاده‌سازی شدن.
+- فقط `/v1/chat/completions`، `/v1/embeddings`، `/v1/models`، `/v1/messages` و `/v1/messages/count_tokens` پیاده‌سازی شده‌اند.
 
 موفق باشی! برای مدل جدید فقط با همون الگوی بخش ۴ یک `POST /admin/models` بزن — نیازی
 به redeploy نیست.

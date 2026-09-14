@@ -88,6 +88,24 @@ export function isAuthorized(request, expectedToken) {
   return timingSafeEqual(token, expectedToken);
 }
 
+// Anthropic SDKs authenticate with `x-api-key`, not `Authorization: Bearer`.
+export function extractApiKeyHeader(request) {
+  const key = request.headers.get("x-api-key");
+  return key && key.trim() ? key.trim() : null;
+}
+
+// Accepts EITHER x-api-key (the real Anthropic convention) OR a plain
+// Authorization: Bearer header, so /v1/messages works with both real
+// Anthropic SDKs and any bearer-token-only proxy/client.
+export function isAuthorizedAnthropicStyle(request, expectedToken) {
+  if (!expectedToken) return false;
+  const apiKey = extractApiKeyHeader(request);
+  if (apiKey) return timingSafeEqual(apiKey, expectedToken);
+  const bearer = extractBearerToken(request);
+  if (bearer) return timingSafeEqual(bearer, expectedToken);
+  return false;
+}
+
 // ---------------------------------------------------------------------------
 // HTTP helpers
 // ---------------------------------------------------------------------------
@@ -95,7 +113,7 @@ export function isAuthorized(request, expectedToken) {
 const CORS_HEADERS = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET, POST, PATCH, DELETE, OPTIONS",
-  "access-control-allow-headers": "authorization, content-type",
+  "access-control-allow-headers": "authorization, content-type, x-api-key, anthropic-version",
 };
 
 export function json(data, status = 200, extraHeaders = {}) {
@@ -128,6 +146,12 @@ export function unauthorized(message = "Unauthorized: missing or invalid bearer 
 
 export function openAiError(message, status = 400, type = "invalid_request_error") {
   return json({ error: { message, type, code: status } }, status);
+}
+
+// Anthropic's error envelope shape differs from OpenAI's - {"type":"error", ...}
+// instead of {"error": {...}}.
+export function anthropicError(message, status = 400, type = "invalid_request_error") {
+  return json({ type: "error", error: { type, message } }, status);
 }
 
 export async function safeReadText(response) {

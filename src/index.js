@@ -2,6 +2,12 @@ import { RouterDO } from "./routerDO.js";
 import { handleTelegramWebhook, sendOwnerAlert } from "./telegram.js";
 import { translateRequestToNative, translateNativeResponseToOpenAi } from "./nativeTranslate.js";
 import {
+  translateAnthropicRequestToNative,
+  translateNativeResponseToAnthropic,
+  createAnthropicSseTransformer,
+  translateAnthropicCountTokensRequest,
+} from "./anthropicTranslate.js";
+import {
   PROVIDER_ENDPOINTS,
   MAX_ATTEMPTS,
   UPSTREAM_TIMEOUT_MS,
@@ -21,6 +27,9 @@ import {
   openAiError,
   safeReadText,
   pcmToWavBase64,
+  extractApiKeyHeader,
+  isAuthorizedAnthropicStyle,
+  anthropicError,
 } from "./util.js";
 
 export { RouterDO };
@@ -51,8 +60,30 @@ export default {
       }
 
       if (path === "/v1/models" && request.method === "GET") {
-        if (!isAuthorized(request, env.PROXY_TOKEN)) return unauthorized();
         const stub = getStub(env);
+        // Discriminate by header: real Anthropic SDKs always send anthropic-version
+        // and authenticate with x-api-key; OpenAI-compatible callers do neither.
+        const wantsAnthropicShape = request.headers.has("anthropic-version") || !!extractApiKeyHeader(request);
+
+        if (wantsAnthropicShape) {
+          if (!isAuthorizedAnthropicStyle(request, env.PROXY_TOKEN)) {
+            return anthropicError("Unauthorized: missing or invalid x-api-key.", 401, "authentication_error");
+          }
+          const models = await stub.listModels();
+          // created_at isn't tracked per model row - a fixed epoch value is a
+          // harmless placeholder since no caller is expected to sort by it.
+          const placeholderCreatedAt = new Date(0).toISOString();
+          const data = models
+            .filter((m) => m.enabled && m.kind === "chat")
+            .sort((a, b) => a.order_num - b.order_num)
+            .map((m) => ({ type: "model", id: m.name, display_name: m.name, created_at: placeholderCreatedAt }));
+          data.unshift({ type: "model", id: "stable", display_name: "stable (auto, stability-first fallback order)", created_at: placeholderCreatedAt });
+          data.unshift({ type: "model", id: "fast", display_name: "fast (auto, speed-first fallback order)", created_at: placeholderCreatedAt });
+          data.unshift({ type: "model", id: "auto", display_name: "auto (default fallback order)", created_at: placeholderCreatedAt });
+          return withCors(json({ data, has_more: false, first_id: data[0]?.id ?? null, last_id: data[data.length - 1]?.id ?? null }));
+        }
+
+        if (!isAuthorized(request, env.PROXY_TOKEN)) return unauthorized();
         const models = await stub.listModels();
         const data = models
           .filter((m) => m.enabled)
@@ -70,6 +101,25 @@ export default {
       if (path === "/v1/embeddings" && request.method === "POST") {
         if (!isAuthorized(request, env.PROXY_TOKEN)) return unauthorized();
         return await handleEmbeddings(request, env, ctx);
+      }
+
+      // ---------------------------------------------------------------
+      // Anthropic-facing surface - Messages API shape, bridged to the SAME
+      // Google upstream as the OpenAI-facing surface above. See
+      // src/anthropicTranslate.js for the full translation logic.
+      // ---------------------------------------------------------------
+      if (path === "/v1/messages/count_tokens" && request.method === "POST") {
+        if (!isAuthorizedAnthropicStyle(request, env.PROXY_TOKEN)) {
+          return anthropicError("Unauthorized: missing or invalid x-api-key.", 401, "authentication_error");
+        }
+        return await handleAnthropicCountTokens(request, env, ctx);
+      }
+
+      if (path === "/v1/messages" && request.method === "POST") {
+        if (!isAuthorizedAnthropicStyle(request, env.PROXY_TOKEN)) {
+          return anthropicError("Unauthorized: missing or invalid x-api-key.", 401, "authentication_error");
+        }
+        return await handleAnthropicMessages(request, env, ctx);
       }
 
       // ---------------------------------------------------------------
@@ -351,6 +401,273 @@ async function handleChatCompletions(request, env, ctx) {
     lastErrorStatus,
     "upstream_error"
   );
+}
+
+// ===========================================================================
+// Anthropic Messages API bridge logic (mirrors handleChatCompletions above,
+// but the wire format on BOTH sides differs: caller speaks Anthropic
+// Messages, upstream is ALWAYS Google's native generateContent/
+// streamGenerateContent - never the OpenAI-compat shim).
+// ===========================================================================
+
+async function handleAnthropicMessages(request, env, ctx) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return anthropicError("Request body must be valid JSON.", 400, "invalid_request_error");
+  }
+
+  if (!Array.isArray(body.messages) || body.messages.length === 0) {
+    return anthropicError("`messages` is required and must be a non-empty array.", 400, "invalid_request_error");
+  }
+  if (typeof body.max_tokens !== "number") {
+    return anthropicError("`max_tokens` is required.", 400, "invalid_request_error");
+  }
+
+  // Same auto/fast/stable + "unknown model name falls back to auto ordering"
+  // semantics as the OpenAI-facing endpoint - see pickCandidate() in
+  // routerDO.js, which needs NO changes to support this.
+  const requestedModel = typeof body.model === "string" && body.model.trim() ? body.model.trim() : "auto";
+  const isStream = !!body.stream;
+  const stub = getStub(env);
+  const excludePairs = [];
+  let lastErrorPayload = null;
+  let lastErrorStatus = 502;
+
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    const candidate = await stub.pickCandidate({ requestedModel, excludePairs, kind: "chat" });
+
+    if (!candidate) {
+      const status = await stub.getStatus();
+      const msg = buildExhaustionMessage(status);
+      ctx.waitUntil(
+        sendOwnerAlert(env, `🚨 <b>همه‌ی مدل‌ها/کلیدها exhausted شدن (Anthropic bridge)</b>\n${escapeHtmlAlert(msg)}`)
+      );
+      return anthropicError(msg, 429, "rate_limit_error");
+    }
+
+    if (candidate.provider !== "google") {
+      // This bridge only ever talks to Google upstream - skip any
+      // non-google model row (e.g. an accidental openrouter entry).
+      excludePairs.push(`model:${candidate.modelId}`);
+      continue;
+    }
+
+    const { url, body: nativeBody } = translateAnthropicRequestToNative(body, {
+      modelName: candidate.modelName,
+      defaultThinking: candidate.defaultThinking,
+    });
+
+    const startedAt = Date.now();
+    let upstreamResp;
+    try {
+      upstreamResp = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-goog-api-key": candidate.apiKey },
+        body: JSON.stringify(nativeBody),
+        signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+      });
+    } catch (networkErr) {
+      excludePairs.push(`model:${candidate.modelId}`);
+      ctx.waitUntil(
+        stub.reportFailure({
+          keyId: candidate.keyId,
+          modelId: candidate.modelId,
+          httpStatus: 0,
+          errorMessage: `network error: ${networkErr.message || networkErr}`,
+          scope: "model",
+        })
+      );
+      lastErrorPayload = String(networkErr.message || networkErr);
+      lastErrorStatus = 502;
+      continue;
+    }
+
+    if (upstreamResp.status === 429) {
+      const errText = await safeReadText(upstreamResp);
+      excludePairs.push(`${candidate.keyId}:${candidate.modelId}`);
+      ctx.waitUntil(
+        stub.reportFailure({ keyId: candidate.keyId, modelId: candidate.modelId, httpStatus: 429, errorMessage: errText, scope: "key" })
+      );
+      lastErrorPayload = errText;
+      lastErrorStatus = 429;
+      continue;
+    }
+
+    const isTransient500 = upstreamResp.status === 500 && (await isTransientGoogleError(upstreamResp.clone()));
+    if ([502, 503, 504, 524].includes(upstreamResp.status) || isTransient500) {
+      const errText = await safeReadText(upstreamResp);
+      excludePairs.push(`model:${candidate.modelId}`);
+      ctx.waitUntil(
+        stub.reportFailure({
+          keyId: candidate.keyId,
+          modelId: candidate.modelId,
+          httpStatus: upstreamResp.status,
+          errorMessage: errText,
+          scope: "model",
+        })
+      );
+      lastErrorPayload = errText;
+      lastErrorStatus = upstreamResp.status;
+      continue;
+    }
+
+    if (upstreamResp.status === 400) {
+      const errText = await safeReadText(upstreamResp);
+      ctx.waitUntil(
+        stub.reportFailure({ keyId: candidate.keyId, modelId: candidate.modelId, httpStatus: 400, errorMessage: errText, scope: "none" })
+      );
+      ctx.waitUntil(
+        sendOwnerAlert(
+          env,
+          `🚨 <b>خطای ۴۰۰ (Anthropic bridge، بدون retry)</b>\nمدل: ${candidate.modelName}\n<code>${escapeHtmlAlert(errText.slice(0, 600))}</code>`
+        )
+      );
+      return anthropicError(errText || "Bad request.", 400, "invalid_request_error");
+    }
+
+    if (upstreamResp.status === 401 || upstreamResp.status === 403) {
+      const errText = await safeReadText(upstreamResp);
+      excludePairs.push(`${candidate.keyId}:${candidate.modelId}`);
+      ctx.waitUntil(
+        stub.reportFailure({
+          keyId: candidate.keyId,
+          modelId: candidate.modelId,
+          httpStatus: upstreamResp.status,
+          errorMessage: errText,
+          scope: "key",
+        })
+      );
+      lastErrorPayload = errText;
+      lastErrorStatus = upstreamResp.status;
+      continue;
+    }
+
+    if (!upstreamResp.ok) {
+      const errText = await safeReadText(upstreamResp);
+      ctx.waitUntil(
+        stub.reportFailure({
+          keyId: candidate.keyId,
+          modelId: candidate.modelId,
+          httpStatus: upstreamResp.status,
+          errorMessage: errText,
+          scope: "none",
+        })
+      );
+      ctx.waitUntil(
+        sendOwnerAlert(
+          env,
+          `🚨 <b>خطای HTTP ${upstreamResp.status} (Anthropic bridge)</b>\nمدل: ${candidate.modelName}\n<code>${escapeHtmlAlert(errText.slice(0, 600))}</code>`
+        )
+      );
+      return anthropicError(errText || "Upstream error.", upstreamResp.status >= 500 ? 502 : upstreamResp.status, "api_error");
+    }
+
+    // --- success ------------------------------------------------------
+    const latencyMs = Date.now() - startedAt;
+
+    if (isStream) {
+      const transformer = createAnthropicSseTransformer(candidate.modelName, {
+        onUsage: (usage) => {
+          ctx.waitUntil(
+            stub.reportSuccess({
+              keyId: candidate.keyId,
+              modelId: candidate.modelId,
+              promptTokens: usage.prompt_tokens,
+              completionTokens: usage.completion_tokens,
+              totalTokens: usage.total_tokens,
+              latencyMs,
+            })
+          );
+        },
+      });
+      const clientStream = upstreamResp.body.pipeThrough(transformer);
+      return withCors(
+        new Response(clientStream, {
+          status: 200,
+          headers: { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" },
+        })
+      );
+    }
+
+    let nativeJson;
+    try {
+      nativeJson = JSON.parse(await upstreamResp.text());
+    } catch (err) {
+      return anthropicError(`Upstream returned invalid JSON: ${err.message}`, 502, "api_error");
+    }
+    const anthropicJson = translateNativeResponseToAnthropic(nativeJson, candidate.modelName);
+    ctx.waitUntil(
+      stub.reportSuccess({
+        keyId: candidate.keyId,
+        modelId: candidate.modelId,
+        promptTokens: anthropicJson.usage.input_tokens,
+        completionTokens: anthropicJson.usage.output_tokens,
+        totalTokens: anthropicJson.usage.input_tokens + anthropicJson.usage.output_tokens,
+        latencyMs,
+      })
+    );
+    return json(anthropicJson);
+  }
+
+  ctx.waitUntil(
+    sendOwnerAlert(
+      env,
+      `🚨 <b>تمام ${MAX_ATTEMPTS} تلاش ناموفق بود (Anthropic bridge)</b>\nآخرین خطا (HTTP ${lastErrorStatus}):\n<code>${escapeHtmlAlert(
+        String(lastErrorPayload || "unknown").slice(0, 600)
+      )}</code>`
+    )
+  );
+  return anthropicError(
+    `All retry attempts were exhausted. Last upstream error: ${lastErrorPayload || "unknown"}`,
+    lastErrorStatus >= 500 ? 502 : lastErrorStatus,
+    "api_error"
+  );
+}
+
+async function handleAnthropicCountTokens(request, env, ctx) {
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return anthropicError("Request body must be valid JSON.", 400, "invalid_request_error");
+  }
+
+  if (!Array.isArray(body.messages) || body.messages.length === 0) {
+    return anthropicError("`messages` is required and must be a non-empty array.", 400, "invalid_request_error");
+  }
+
+  const requestedModel = typeof body.model === "string" && body.model.trim() ? body.model.trim() : "auto";
+  const stub = getStub(env);
+  const candidate = await stub.pickCandidate({ requestedModel, excludePairs: [], kind: "chat" });
+
+  if (!candidate) {
+    return anthropicError("No healthy model/key available for count_tokens.", 502, "api_error");
+  }
+
+  const { url, body: nativeBody } = translateAnthropicCountTokensRequest(body, {
+    modelName: candidate.modelName,
+  });
+
+  try {
+    const upstreamResp = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-goog-api-key": candidate.apiKey },
+      body: JSON.stringify(nativeBody),
+      signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+    });
+
+    if (!upstreamResp.ok) {
+      const errText = await safeReadText(upstreamResp);
+      return anthropicError(errText || "Google countTokens failed.", upstreamResp.status >= 500 ? 502 : upstreamResp.status, "api_error");
+    }
+
+    const jsonResp = await upstreamResp.json();
+    return json({ input_tokens: jsonResp.totalTokens || 0 });
+  } catch (err) {
+    return anthropicError(`Network error during count_tokens: ${err.message || err}`, 502, "api_error");
+  }
 }
 
 // ===========================================================================

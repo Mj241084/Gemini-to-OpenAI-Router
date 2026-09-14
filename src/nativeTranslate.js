@@ -57,6 +57,8 @@ export function translateToolsWithCache(tools) {
 // this array - no need to get the list perfect up front.
 const UNSUPPORTED_SCHEMA_KEYS = [
   "additionalProperties", // confirmed via live 400
+  "exclusiveMinimum", // confirmed via live 400 from Claude Code tool schema
+  "exclusiveMaximum",
   "$schema",
   "$id",
   "$ref",
@@ -94,17 +96,15 @@ export function uppercaseSchemaTypes(schema) {
     copy.items = uppercaseSchemaTypes(copy.items);
   }
 
-  // NOT YET HANDLED / NOT LIVE-TESTED: `anyOf` / `oneOf` / `allOf` (JSON-Schema
-  // union composition - commonly emitted for Optional[...]/nullable fields by
-  // Pydantic v2 and some Zod converters as e.g. `anyOf: [{type:"string"},
-  // {type:"null"}]`). Whether this specific Gemini API version's Schema object
-  // supports `anyOf` at all is genuinely unconfirmed here. If a future 400
-  // mentions "anyOf"/"oneOf"/"allOf" in the field path, that is the signal to
-  // live-test the exact accepted shape (same methodology used to confirm the
-  // additionalProperties fix) before writing translation logic for it - for
-  // now these keys pass through UNCHANGED if present, which means any nested
-  // `type` values inside them stay lowercase and could trigger a *different*
-  // 400 on their own.
+  // `anyOf` / `oneOf` / `allOf` (JSON-Schema composition keywords commonly
+  // emitted for Optional[...]/nullable fields by Pydantic v2 / Zod). Confirmed
+  // live against Gemini 3.6: Google accepts composition constructs natively.
+  // We recurse into each array element so nested `type` values get uppercased.
+  for (const composeKey of ["anyOf", "oneOf", "allOf"]) {
+    if (Array.isArray(copy[composeKey])) {
+      copy[composeKey] = copy[composeKey].map((item) => uppercaseSchemaTypes(item));
+    }
+  }
 
   return copy;
 }
