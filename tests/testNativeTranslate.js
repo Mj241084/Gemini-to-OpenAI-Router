@@ -62,6 +62,70 @@ function runTests() {
   }
 
   // ---------------------------------------------------------------------------
+  // Test 1b: Comprehensive Allowlist & Examples Mapping Test
+  // ---------------------------------------------------------------------------
+  try {
+    const schema = {
+      type: "object",
+      propertyNames: { pattern: "^[a-z]+$" },
+      patternProperties: { "^S_": { type: "string" } },
+      const: "fixed",
+      readOnly: true,
+      writeOnly: true,
+      deprecated: true,
+      examples: ["ex1", "ex2"],
+      properties: {
+        age: { type: "integer", exclusiveMinimum: 0, exclusiveMaximum: 120 },
+      },
+    };
+    const out = uppercaseSchemaTypes(schema);
+    assert(!("propertyNames" in out), "propertyNames dropped (allowlist)");
+    assert(!("patternProperties" in out), "patternProperties dropped (allowlist)");
+    assert(!("const" in out), "const dropped (allowlist)");
+    assert(!("readOnly" in out), "readOnly dropped (allowlist)");
+    assert(!("writeOnly" in out), "writeOnly dropped (allowlist)");
+    assert(!("deprecated" in out), "deprecated dropped (allowlist)");
+    assert(out.example === "ex1", "plural examples[] mapped to singular example (first item)");
+    assert(!("examples" in out), "plural examples key itself removed");
+    assert(!("exclusiveMinimum" in out.properties.age), "exclusiveMinimum dropped inside nested property");
+    assert(!("exclusiveMaximum" in out.properties.age), "exclusiveMaximum dropped inside nested property");
+  } catch (err) {
+    console.error("Allowlist comprehensive test crashed:", err);
+    failed++;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 1c: Allowlist Regression Guard Test
+  // ---------------------------------------------------------------------------
+  try {
+    // Confirm allowed fields survive untouched (regression guard against an
+    // overly-aggressive allowlist that accidentally drops something valid)
+    const schema = {
+      type: "string",
+      title: "Age",
+      description: "User age",
+      format: "int32",
+      nullable: true,
+      minimum: 0,
+      maximum: 120,
+      minLength: 1,
+      maxLength: 3,
+      pattern: "^[0-9]+$",
+      default: 18,
+      example: 25,
+      enum: ["a", "b"],
+    };
+    const out = uppercaseSchemaTypes(schema);
+    for (const key of ["title", "description", "format", "nullable", "minimum", "maximum", "minLength", "maxLength", "pattern", "default", "example", "enum"]) {
+      assert(key in out, `allowed field "${key}" survives untouched`);
+    }
+    assert(out.type === "STRING", "type still uppercased alongside allowlist filtering");
+  } catch (err) {
+    console.error("Allowlist regression guard test crashed:", err);
+    failed++;
+  }
+
+  // ---------------------------------------------------------------------------
   // Test 2: Basic Chat Request Translation
   // ---------------------------------------------------------------------------
   try {

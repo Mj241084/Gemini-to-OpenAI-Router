@@ -52,34 +52,67 @@ export function translateToolsWithCache(tools) {
 //     (worst case: a purely cosmetic/validation hint is dropped) versus the
 //     alternative (another blind 400).
 //
-// Google's error format is self-diagnosing ("Unknown name \"X\" at '...'"), so
-// if a NEW unsupported field shows up later, the fix is a one-line addition to
-// this array - no need to get the list perfect up front.
-const UNSUPPORTED_SCHEMA_KEYS = [
-  "additionalProperties", // confirmed via live 400
-  "exclusiveMinimum", // confirmed via live 400 from Claude Code tool schema
-  "exclusiveMaximum",
-  "$schema",
-  "$id",
-  "$ref",
-  "$defs",
-  "definitions",
-  "unevaluatedProperties",
-  "unevaluatedItems",
-  "patternProperties",
-  "additionalItems",
-  "const",
-  "contentEncoding",
-  "contentMediaType",
-  "examples",
-];
+// Google's native Schema object (used in functionDeclarations[].parameters
+// and generationConfig.responseSchema) is a curated, LIMITED subset of
+// OpenAPI 3.0/JSON Schema. This list was NOT guessed - it is the result of
+// live-testing every field individually against gemini-3.6-flash:generateContent
+// with a real API key, cross-referenced against Claude Code's actual built-in
+// tool schemas (Zod/Pydantic/Draft-2020-12 generated) and the free-claude-code
+// reference project. See router README section 12 / cloudflare-projects-
+// lessons-learned.md for the full methodology and confirmed field table.
+//
+// STRICT ALLOWLIST, not blocklist: any key not in this set is silently
+// dropped. This is deliberate - the alternative (blocklist) requires us to
+// predict every JSON-Schema-draft keyword any future tool/schema generator
+// might emit, which already failed 3 times in a row (additionalProperties,
+// then exclusiveMinimum/Maximum, then propertyNames). An allowlist degrades
+// gracefully (a stray keyword is just dropped) instead of hard-failing with
+// a 400 that breaks the entire tool call.
+const GEMINI_SCHEMA_ALLOWED_KEYS = new Set([
+  "type",
+  "format",
+  "title",
+  "description",
+  "nullable",
+  "enum",
+  "maxItems",
+  "minItems",
+  "properties",
+  "required",
+  "minProperties",
+  "maxProperties",
+  "minLength",
+  "maxLength",
+  "pattern",
+  "example", // singular only - Gemini rejects the plural "examples"
+  "anyOf",
+  "oneOf",
+  "allOf",
+  "propertyOrdering",
+  "default",
+  "items",
+  "minimum",
+  "maximum",
+]);
 
 export function uppercaseSchemaTypes(schema) {
   if (!schema || typeof schema !== "object") return schema;
-  const copy = { ...schema };
 
-  for (const key of UNSUPPORTED_SCHEMA_KEYS) {
-    delete copy[key];
+  const copy = {};
+  for (const [key, value] of Object.entries(schema)) {
+    if (GEMINI_SCHEMA_ALLOWED_KEYS.has(key)) {
+      copy[key] = value;
+    } else if (key === "examples" && Array.isArray(value) && value.length > 0 && copy.example === undefined) {
+      // Draft-2020-12 generators (Zod/Pydantic) commonly emit the plural
+      // array form; Gemini only accepts the singular "example". Take the
+      // first item rather than silently losing the hint entirely.
+      copy.example = value[0];
+    }
+    // else: silently dropped - confirmed via live test to be rejected
+    // (additionalProperties, exclusiveMinimum/Maximum, propertyNames,
+    // patternProperties, const, readOnly, writeOnly, deprecated, $schema,
+    // $id, $ref, $defs, unevaluatedProperties, unevaluatedItems, ...) or
+    // simply unknown/unconfirmed - both cases are safe to drop.
   }
 
   if (typeof copy.type === "string") {
@@ -95,11 +128,6 @@ export function uppercaseSchemaTypes(schema) {
   if (copy.items && typeof copy.items === "object") {
     copy.items = uppercaseSchemaTypes(copy.items);
   }
-
-  // `anyOf` / `oneOf` / `allOf` (JSON-Schema composition keywords commonly
-  // emitted for Optional[...]/nullable fields by Pydantic v2 / Zod). Confirmed
-  // live against Gemini 3.6: Google accepts composition constructs natively.
-  // We recurse into each array element so nested `type` values get uppercased.
   for (const composeKey of ["anyOf", "oneOf", "allOf"]) {
     if (Array.isArray(copy[composeKey])) {
       copy[composeKey] = copy[composeKey].map((item) => uppercaseSchemaTypes(item));
