@@ -305,6 +305,10 @@ claude
 }
 ```
 
+> برای مستندات کامل فنی این پل (شامل تاریخچه‌ی مشکلات واقعی که با تست زنده کشف
+> و حل شدن — امضای تفکر در حالت استریم، تبدیل schema از blocklist به allowlist،
+> و شکل دقیق بدنه‌ی `:countTokens`)، به `anthropic-bridge-migration.md` مراجعه کن.
+
 ---
 
 ## ۷) TTS — چرا از مسیر بومی گوگل رد می‌شه
@@ -427,6 +431,10 @@ npx wrangler tail   # لاگ زنده worker
 (`context_engineering_is_the_way_to_go`) پر می‌کنه — بدون این‌که امضای واقعی موجود رو
 overwrite کنه. نیازی به کار اضافه نیست.
 
+> همین مکانیزم برای مسیر Anthropic (`/v1/messages`) هم در هر دو حالت streaming و
+> non-streaming پیاده‌سازی شده (`src/anthropicTranslate.js`) — جزئیات کشف باگ اولیه‌ی
+> نسخه‌ی streaming در `anthropic-bridge-migration.md` بخش ۳.۱.
+
 ---
 
 ## ۱۳) خلاصه‌ی env vars / secrets
@@ -461,6 +469,12 @@ overwrite کنه. نیازی به کار اضافه نیست.
   واقعی گوگل زمان دیگه‌ای ریست بشه.
 - روی خطای ۴۰۰، Worker عمداً retry نمی‌کنه.
 - فقط `/v1/chat/completions`، `/v1/embeddings`، `/v1/models`، `/v1/messages` و `/v1/messages/count_tokens` پیاده‌سازی شده‌اند.
+- تبدیل schema ابزارها (`src/nativeTranslate.js`) بر پایه‌ی یک **allowlist قطعی** از
+  فیلدهای تاییدشده‌ی Gemini Schema است، نه blocklist — هر کلید JSON-Schema که در
+  این allowlist نباشه بی‌سروصدا drop می‌شه (نه ۴۰۰). جزئیات کامل در
+  `anthropic-bridge-migration.md` بخش ۳.۲.
+- برای مسیر Anthropic، `stop_reason` مربوط به این‌که کدوم `stop_sequence` دقیقاً
+  باعث توقف شده رو Gemini تفکیک نمی‌کنه؛ همه‌چیز به `end_turn` فروکاسته می‌شه.
 
 موفق باشی! برای مدل جدید فقط با همون الگوی بخش ۴ یک `POST /admin/models` بزن — نیازی
 به redeploy نیست.
