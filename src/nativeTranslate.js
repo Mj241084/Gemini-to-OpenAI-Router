@@ -118,6 +118,18 @@ export function uppercaseSchemaTypes(schema) {
   if (typeof copy.type === "string") {
     copy.type = copy.type.toUpperCase();
   }
+
+  // Gemini's protobuf Schema requires `items` whenever type is ARRAY - unlike
+  // plain JSON Schema, where `{"type":"array"}` with no `items` is valid
+  // ("array of anything"). Confirmed via live 400:
+  //   "...items.items: missing field" - a nested array whose inner array had
+  // no items declared (a perfectly valid, if loose, upstream JSON Schema,
+  // e.g. Zod's z.array(z.array(z.unknown()))). Rather than reject or strip
+  // the field, inject a permissive default so the tool call still works.
+  if (copy.type === "ARRAY" && !copy.items) {
+    copy.items = { type: "STRING" };
+  }
+
   if (copy.properties && typeof copy.properties === "object") {
     const properties = {};
     for (const [k, v] of Object.entries(copy.properties)) {

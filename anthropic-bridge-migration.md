@@ -145,6 +145,57 @@ alias خودمونه (نه اسم واقعی یک مدل Anthropic)، Claude Cod
 کنترل کنی (مثلاً روی ۲۵۰k، اگه می‌خوای مدل زودتر از رسیدن به نقطه‌ای که کیفیتش افت
 می‌کنه خلاصه‌سازی کنه).
 
+### ۳.۵) سطح Thinking: از تک‌لایه به دولایه، و شکل واقعی payload که Claude Code می‌فرسته
+
+**مشکل اول (کشف‌شده با تست زنده):** مدل `gemini-3.7-flash` با پیام
+`Thinking level MINIMAL is not supported for this model` رد می‌شد. علتش این بود که
+مسیر Anthropic (بر خلاف مسیر OpenAI که `reasoning_effort` رو `.toLowerCase()` می‌کنه)
+مقدار `default_thinking` رو دقیقاً همون‌طور که در DB ذخیره شده (بدون نرمال‌سازی)
+می‌فرستاد.
+
+**راه‌حل — مکانیزم دولایه در `applyThinkingConfig`:**
+1. **لایه‌ی اول (پیشگیرانه):** `default_thinking` همیشه قبل از ارسال `.toLowerCase()`
+   می‌شه، صرف‌نظر از این‌که موقع ثبت مدل با چه حروفی وارد شده.
+2. **لایه‌ی دوم (واکنشی، `forceDefaultThinking`):** اگه گوگل حتی بعد از lowercase هم
+   با پیام `thinking level ... is not supported` رد کرد، روتر **یک‌بار** همون
+   کلید/مدل رو دوباره امتحان می‌کنه، این‌بار با نادیده‌گرفتن کامل هر `thinking` که
+   caller فرستاده و استفاده‌ی مستقیم از `default_thinking` ثبت‌شده‌ی همون مدل. این
+   اتفاق یک پیام تلگرام «🔧 Fallback خودکار سطح thinking» تولید می‌کنه — که یک نشونه‌ی
+   موفقیت سیستمه (خودش رو اصلاح کرد)، نه یک خطای واقعی.
+
+**کشف دوم، مهم‌تر — Claude Code اصلاً معمولاً `thinking` صریح نمی‌فرسته:** طبق
+مستندات رسمی Claude Code («On third-party providers Claude Code omits the thinking
+parameter instead of turning thinking off»)، و **تایید شده با `wrangler tail` زنده**،
+دو نوع payload واقعی از Claude Code دیده شد:
+
+```json
+// درخواست‌های کمکی (مثلاً عنوان session) — روی model alias "fast"
+{ "model": "fast", "has_thinking": false, ... }
+
+// مکالمه‌ی اصلی agent — روی model alias "auto"
+{
+  "model": "auto",
+  "thinking": { "type": "adaptive", "display": "omitted" },
+  ...
+}
+```
+
+نکته‌ی فنی مهم: شکل `{"type": "adaptive"}` **در هیچ مستندات رسمی‌ای که موقع طراحی
+اولیه دیدیم نبود** — نه `"enabled"`، نه `"disabled"`. چون کد ما فقط دنبال
+`thinking.type === "enabled" && typeof thinking.budget_tokens === "number"` می‌گرده،
+این شکل جدید به‌طور خودکار (و تصادفی) به شاخه‌ی «هیچ thinking صریحی نیومده» سقوط
+می‌کنه و از `default_thinking` مدل استفاده می‌شه — که دقیقاً رفتار درستیه، ولی
+**شکننده‌ست**: اگه یک نسخه‌ی بعدی Claude Code همراه `type:"adaptive"` یک
+`budget_tokens` عددی هم بفرسته، رفتار عوض می‌شه. یک شاخه‌ی صریح
+`else if (thinking.type === "adaptive") { /* عمداً هیچ کاری نکن */ }` باید قبل از
+تولید نسخه‌ی بعدی این مکانیزم اضافه بشه تا این رفتار «تصادفی درست» به یک تصمیم
+صریح و مستندشده تبدیل بشه (هنوز انجام نشده — رجوع کن به بخش ۸ محدودیت‌های باز).
+
+**نتیجه‌ی عملی مهم:** چون Claude Code معمولاً هیچ `thinking` صریحی نمی‌فرسته،
+`default_thinking` هر مدل عملاً **قرارداد پیش‌فرض واقعی** بین Claude Code و این روتره
+— نه یک fallback نادر. درست تنظیم‌کردن `default_thinking` هر مدل موقع ثبت (با حروف
+کوچیک، مطابق چیزی که خودِ آن مدل واقعاً قبول می‌کنه) از هر تنظیم دیگه‌ای مهم‌تره.
+
 ---
 
 ## ۴) روش‌شناسی تست — چرا این‌بار جواب داد
@@ -187,6 +238,13 @@ export CLAUDE_CODE_MAX_CONTEXT_TOKENS="250000"
 - اگه یک session قدیمی/credentials cache‌شده مزاحمت شد: `claude /logout` یا حذف
   `~/.claude/.credentials.json`.
 - برای دائمی‌کردن، همین متغیرها رو داخل بخش `env` در `~/.claude/settings.json` بذار.
+- **`ANTHROPIC_SMALL_FAST_MODEL`** کنترل می‌کنه کارهای پس‌زمینه‌ای/کمکی (عنوان
+  session، خلاصه‌ی commit، و به‌احتمال زیاد classifier ایمنی auto-approval) از کدوم
+  model alias استفاده کنن — جدا از `ANTHROPIC_MODEL` که فقط مکالمه‌ی اصلیه. اگه
+  نمی‌خوای مدل «اصلی»ات صرف تصمیم‌های سبک بشه، همین متغیر رو روی `fast` نگه دار.
+  ⚠️ این‌که دقیقاً classifier مربوط به auto-approval از همین متغیر استفاده می‌کنه یا
+  نه، هنوز با یک لاگ زنده‌ی مستقیم (نه فقط استنباط از این‌که دیگه خطا نمی‌گیریم)
+  صددرصد تایید نشده — رجوع کن به بخش ۸.
 
 ---
 
@@ -216,3 +274,14 @@ export CLAUDE_CODE_MAX_CONTEXT_TOKENS="250000"
 | ۵۰۲/۵۰۳/۵۰۴/۵۲۴ | خودِ مدل ناپایداره | مدل بعدی، بعد از ۳ بار پشت‌سرهم circuit breaker |
 | ۴۰۰ | مشکل شکل درخواست (اغلب یعنی یک کلید schema جدید کشف شد) | fail-fast، بدون retry — و باید بررسی بشه که آیا allowlist نیاز به آپدیت داره |
 | ۴۰۱/۴۰۳ | کلید نامعتبر/باطل | کلید بعدی |
+
+---
+
+## ۸) موارد باز — چیزهایی که هنوز کامل تایید/بسته نشدن
+
+- **شاخه‌ی صریح برای `thinking.type === "adaptive"`**: رفتار فعلی درسته ولی به یک
+  coincidence وابسته‌ست (بخش ۳.۵). باید به یک `else if` صریح تبدیل بشه، همراه یک
+  تست واحد که دقیقاً `{"type":"adaptive","display":"omitted"}` رو شبیه‌سازی کنه.
+- **تایید مستقیم مدل classifier auto-approval**: با یک `wrangler tail` هم‌زمان با
+  یک عملیات auto-approve واقعی (نه فقط استنباط از نبودِ خطا) باید تایید بشه که این
+  classifier واقعاً از `ANTHROPIC_SMALL_FAST_MODEL` استفاده می‌کنه.

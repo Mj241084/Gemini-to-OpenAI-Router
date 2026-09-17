@@ -126,6 +126,35 @@ function runTests() {
   }
 
   // ---------------------------------------------------------------------------
+  // Test 1d: Missing Nested ARRAY items Injected Test
+  // ---------------------------------------------------------------------------
+  try {
+    const schema = {
+      type: "object",
+      properties: {
+        where: {
+          type: "array",
+          items: { type: "array" }, // missing nested items on purpose
+        },
+      },
+    };
+    const out = uppercaseSchemaTypes(schema);
+    assert(out.properties.where.type === "ARRAY", "outer array type uppercased");
+    assert(out.properties.where.items.type === "ARRAY", "inner array type uppercased");
+    assert(
+      out.properties.where.items.items && typeof out.properties.where.items.items === "object",
+      "missing nested items on an ARRAY type gets a default injected (matches live-confirmed Gemini requirement)"
+    );
+    assert(
+      out.properties.where.items.items.type === "STRING",
+      "injected default items schema has type STRING"
+    );
+  } catch (err) {
+    console.error("Missing nested array items test crashed:", err);
+    failed++;
+  }
+
+  // ---------------------------------------------------------------------------
   // Test 2: Basic Chat Request Translation
   // ---------------------------------------------------------------------------
   try {
