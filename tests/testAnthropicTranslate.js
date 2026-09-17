@@ -408,42 +408,28 @@ async function runTests() {
   }
 
   // ---------------------------------------------------------------------
-  // Test 11: Thinking level normalization and forced fallback
+  // Test 11: Shared thinking resolver (Anthropic path)
   // ---------------------------------------------------------------------
   try {
-    // Case normalization: DB value stored with wrong casing still gets fixed
-    // automatically (Claude Code's normal traffic hits exactly this branch,
-    // since it omits `thinking` on third-party providers).
     const uppercaseDefault = translateAnthropicRequestToNative(
       { max_tokens: 100, messages: [{ role: "user", content: "hi" }] },
       { modelName: "gemini-3.7-flash", defaultThinking: "MINIMAL" }
     );
     assert(
       uppercaseDefault.body.generationConfig.thinkingConfig.thinkingLevel === "minimal",
-      "default_thinking is lowercased before being sent, regardless of DB casing"
+      "default_thinking normalized via shared resolver regardless of DB casing"
     );
 
-    // forceDefaultThinking: explicit caller thinking ignored, default used (and lowercased)
-    const forced = translateAnthropicRequestToNative(
-      { max_tokens: 100, thinking: { type: "enabled", budget_tokens: 500 }, messages: [{ role: "user", content: "hi" }] },
-      { modelName: "gemini-3.7-flash", defaultThinking: "MINIMAL", forceDefaultThinking: true }
+    const adaptiveShape = translateAnthropicRequestToNative(
+      { max_tokens: 100, thinking: { type: "adaptive", display: "omitted" }, messages: [{ role: "user", content: "hi" }] },
+      { modelName: "gemini-3.7-flash", defaultThinking: "high" }
     );
     assert(
-      forced.body.generationConfig.thinkingConfig.thinkingLevel === "minimal",
-      "forceDefaultThinking ignores explicit caller thinking, falls back to lowercased default"
-    );
-
-    // Regression guard: normal explicit thinking still works as before when NOT forced
-    const normal = translateAnthropicRequestToNative(
-      { max_tokens: 100, thinking: { type: "enabled", budget_tokens: 500 }, messages: [{ role: "user", content: "hi" }] },
-      { modelName: "gemini-3.7-flash", defaultThinking: "minimal" }
-    );
-    assert(
-      normal.body.generationConfig.thinkingConfig.thinkingLevel === "low",
-      "without forceDefaultThinking, explicit caller thinking still wins as before"
+      adaptiveShape.body.generationConfig.thinkingConfig.thinkingLevel === "high",
+      "Claude Code's 'adaptive' shape falls through to the model's default, explicitly (not by coincidence)"
     );
   } catch (err) {
-    console.error("Thinking normalization/fallback test crashed:", err);
+    console.error("Shared thinking resolver (Anthropic path) test crashed:", err);
     failed++;
   }
 

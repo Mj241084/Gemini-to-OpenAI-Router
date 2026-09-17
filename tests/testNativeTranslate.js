@@ -6,7 +6,8 @@
 import { 
   translateRequestToNative, 
   translateNativeResponseToOpenAi, 
-  uppercaseSchemaTypes 
+  uppercaseSchemaTypes,
+  resolveGemini3ThinkingLevel
 } from "../src/nativeTranslate.js";
 
 function runTests() {
@@ -319,6 +320,23 @@ function runTests() {
     // Test Gemini 2.5
     const resG25 = translateRequestToNative(openAiRequest, { modelName: "gemini-2.5-flash" });
     assert(resG25.body.generationConfig.thinkingConfig.thinkingBudget === 2048, "Gemini 2.5 maps medium to thinkingBudget 2048");
+
+    // Test resolveGemini3ThinkingLevel helper directly
+    assert(resolveGemini3ThinkingLevel("none", "high") === "minimal", "'none' alias maps to minimal");
+    assert(resolveGemini3ThinkingLevel("MINIMAL", "high") === "minimal", "case-insensitive valid value passes through");
+    assert(resolveGemini3ThinkingLevel("banana", "medium") === "medium", "unrecognized value falls back to defaultThinking");
+    assert(resolveGemini3ThinkingLevel(null, "LOW") === "low", "missing raw value uses lowercased default");
+    assert(resolveGemini3ThinkingLevel("banana", "also-invalid") === null, "nothing usable anywhere -> null (omit thinkingConfig)");
+
+    // Hermes 'none' regression test
+    const resultHermes = translateRequestToNative(
+      { model: "gemini-3.6-flash", messages: [{ role: "user", content: "hi" }], reasoning_effort: "none" },
+      { modelName: "gemini-3.6-flash", defaultThinking: "high" }
+    );
+    assert(
+      resultHermes.body.generationConfig.thinkingConfig.thinkingLevel === "minimal",
+      "reasoning_effort:'none' from Hermes-style callers no longer reaches Google raw - maps to minimal"
+    );
   } catch (err) {
     console.error("Test 6 crashed:", err);
     failed++;

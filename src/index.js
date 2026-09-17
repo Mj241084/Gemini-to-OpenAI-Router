@@ -454,61 +454,32 @@ async function handleAnthropicMessages(request, env, ctx) {
       continue;
     }
 
+    const { url, body: nativeBody } = translateAnthropicRequestToNative(body, {
+      modelName: candidate.modelName,
+      defaultThinking: candidate.defaultThinking,
+    });
+
     const startedAt = Date.now();
-    let forceDefaultThinking = false;
     let upstreamResp;
-    let networkFailed = false;
-    let networkErrMsg = "";
-
-    for (let thinkingAttempt = 0; thinkingAttempt < 2; thinkingAttempt++) {
-      const { url, body: nativeBody } = translateAnthropicRequestToNative(body, {
-        modelName: candidate.modelName,
-        defaultThinking: candidate.defaultThinking,
-        forceDefaultThinking,
+    try {
+      upstreamResp = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-goog-api-key": candidate.apiKey },
+        body: JSON.stringify(nativeBody),
+        signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
       });
-
-      try {
-        upstreamResp = await fetch(url, {
-          method: "POST",
-          headers: { "content-type": "application/json", "x-goog-api-key": candidate.apiKey },
-          body: JSON.stringify(nativeBody),
-          signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
-        });
-      } catch (networkErr) {
-        networkFailed = true;
-        networkErrMsg = String(networkErr.message || networkErr);
-        break;
-      }
-
-      if (upstreamResp.status === 400 && thinkingAttempt === 0 && !forceDefaultThinking && candidate.defaultThinking) {
-        const peekText = await safeReadText(upstreamResp.clone());
-        if (isUnsupportedThinkingLevelError(peekText)) {
-          forceDefaultThinking = true;
-          ctx.waitUntil(
-            sendOwnerAlert(
-              env,
-              `🔧 <b>Fallback خودکار سطح thinking</b>\nمدل: ${candidate.modelName}\nسطح ارسالی (حتی بعد از lowercase) رد شد؛ با default_thinking ثبت‌شده دوباره تلاش شد.`
-            )
-          );
-          continue;
-        }
-      }
-
-      break;
-    }
-
-    if (networkFailed) {
+    } catch (networkErr) {
       excludePairs.push(`model:${candidate.modelId}`);
       ctx.waitUntil(
         stub.reportFailure({
           keyId: candidate.keyId,
           modelId: candidate.modelId,
           httpStatus: 0,
-          errorMessage: `network error: ${networkErrMsg}`,
+          errorMessage: `network error: ${networkErr.message || networkErr}`,
           scope: "model",
         })
       );
-      lastErrorPayload = networkErrMsg;
+      lastErrorPayload = String(networkErr.message || networkErr);
       lastErrorStatus = 502;
       continue;
     }

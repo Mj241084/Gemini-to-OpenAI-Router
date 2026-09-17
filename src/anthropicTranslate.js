@@ -10,7 +10,7 @@
  * nativeTranslate.js for the OpenAI-facing side of this router.
  */
 
-import { uppercaseSchemaTypes } from "./nativeTranslate.js";
+import { uppercaseSchemaTypes, resolveGemini3ThinkingLevel } from "./nativeTranslate.js";
 
 const GEMINI3_MODEL_RE = /gemini-3/i;
 const GEMINI25_MODEL_RE = /gemini-2\.5/i;
@@ -82,7 +82,7 @@ function translateAnthropicToolChoice(toolChoice) {
 // Extended thinking translation (Anthropic budget_tokens -> Gemini thinking)
 // ---------------------------------------------------------------------------
 
-function applyThinkingConfig(genConfig, { thinking, modelName, defaultThinking, forceDefaultThinking }) {
+function applyThinkingConfig(genConfig, { thinking, modelName, defaultThinking }) {
   const isGemini3 = GEMINI3_MODEL_RE.test(modelName);
   const isGemini25 = GEMINI25_MODEL_RE.test(modelName);
   if (!isGemini3 && !isGemini25) return; // model row has no thinking knob we know how to drive
@@ -90,58 +90,44 @@ function applyThinkingConfig(genConfig, { thinking, modelName, defaultThinking, 
   let budgetTokens = null;
   let explicitlyDisabled = false;
 
-  // forceDefaultThinking: a previous attempt with this SAME candidate failed
-  // because Google rejected the thinking level we sent (see
-  // isUnsupportedThinkingLevelError() in index.js) even AFTER the lowercase
-  // normalization below. This is the second and final line of defense: fall
-  // back to the model row's own configured default_thinking, trusting it
-  // was set correctly at model-registration time.
-  if (!forceDefaultThinking && thinking && typeof thinking === "object") {
+  if (thinking && typeof thinking === "object") {
     if (thinking.type === "disabled") {
       explicitlyDisabled = true;
     } else if (thinking.type === "enabled" && typeof thinking.budget_tokens === "number") {
       budgetTokens = thinking.budget_tokens;
     }
-  }
-  // NOTE: per Claude Code's own documented behavior ("On third-party
-  // providers Claude Code omits the thinking parameter instead of turning
-  // thinking off"), a normal Claude Code request against this router will
-  // usually hit the budgetTokens===null branch below anyway - "no explicit
-  // thinking sent" is the COMMON case for Claude Code traffic, not an edge
-  // case. This is what makes default_thinking effectively the agreed
-  // contract between Claude Code and this router - see bridge docs.
-
-  if (explicitlyDisabled) {
-    genConfig.thinkingConfig = isGemini3 ? { thinkingLevel: "minimal" } : { thinkingBudget: 0 };
-    return;
-  }
-
-  if (budgetTokens === null) {
-    if (!defaultThinking) return;
-    if (isGemini3) {
-      // ALWAYS lowercase here: Gemini's thinkingLevel enum is
-      // lowercase-only ("minimal"/"low"/"medium"/"high"). default_thinking
-      // is admin-entered free text at model-registration time and could in
-      // principle carry any casing - normalize it right before it leaves
-      // our system, regardless of how it's stored in the DB.
-      genConfig.thinkingConfig = { thinkingLevel: String(defaultThinking).toLowerCase() };
-    } else {
-      const budget = defaultThinking === "high" || defaultThinking === "medium" ? 2048 : 1024;
-      genConfig.thinkingConfig = { thinkingBudget: budget };
-    }
-    return;
+    // Any other shape (e.g. Claude Code's {"type":"adaptive"}) intentionally
+    // falls through with budgetTokens still null - treated as "no explicit
+    // value", resolved from the model's own default below. This is now an
+    // EXPLICIT, documented decision (not a coincidence like before).
   }
 
   if (isGemini3) {
-    // APPROXIMATION, not a documented equivalence: Anthropic's budget_tokens
-    // is a raw token count, Gemini 3's thinkingLevel is a coarse 4-step enum.
-    let level;
-    if (budgetTokens <= 1024) level = "low";
-    else if (budgetTokens <= 8192) level = "medium";
-    else level = "high";
-    genConfig.thinkingConfig = { thinkingLevel: level };
-  } else {
+    if (explicitlyDisabled) {
+      genConfig.thinkingConfig = { thinkingLevel: "minimal" };
+      return;
+    }
+    let rawLevel = null;
+    if (budgetTokens !== null) {
+      // APPROXIMATION: Anthropic's budget_tokens is a raw token count,
+      // Gemini 3's thinkingLevel is a coarse 4-step enum.
+      if (budgetTokens <= 1024) rawLevel = "low";
+      else if (budgetTokens <= 8192) rawLevel = "medium";
+      else rawLevel = "high";
+    }
+    const level = resolveGemini3ThinkingLevel(rawLevel, defaultThinking);
+    if (level) genConfig.thinkingConfig = { thinkingLevel: level };
+    return;
+  }
+
+  // Gemini 2.5: numeric budget, no closed-enum failure mode.
+  if (explicitlyDisabled) {
+    genConfig.thinkingConfig = { thinkingBudget: 0 };
+  } else if (budgetTokens !== null) {
     genConfig.thinkingConfig = { thinkingBudget: Math.max(0, Math.min(budgetTokens, 24576)) };
+  } else if (defaultThinking) {
+    const budget = defaultThinking === "high" || defaultThinking === "medium" ? 2048 : 1024;
+    genConfig.thinkingConfig = { thinkingBudget: budget };
   }
 }
 
@@ -262,7 +248,7 @@ function buildNativePromptParts(anthropicBody) {
  *   as nativeTranslate.js's translateRequestToNative.
  * @returns {{url: string, body: Object}}
  */
-export function translateAnthropicRequestToNative(anthropicBody, { modelName, defaultThinking, forceDefaultThinking } = {}) {
+export function translateAnthropicRequestToNative(anthropicBody, { modelName, defaultThinking } = {}) {
   const isStream = !!anthropicBody.stream;
   const action = isStream ? "streamGenerateContent" : "generateContent";
   const streamSuffix = isStream ? "?alt=sse" : "";
@@ -279,7 +265,7 @@ export function translateAnthropicRequestToNative(anthropicBody, { modelName, de
   if (Array.isArray(anthropicBody.stop_sequences) && anthropicBody.stop_sequences.length > 0) {
     genConfig.stopSequences = anthropicBody.stop_sequences;
   }
-  applyThinkingConfig(genConfig, { thinking: anthropicBody.thinking, modelName, defaultThinking, forceDefaultThinking });
+  applyThinkingConfig(genConfig, { thinking: anthropicBody.thinking, modelName, defaultThinking });
 
   if (Object.keys(genConfig).length > 0) nativeBody.generationConfig = genConfig;
 

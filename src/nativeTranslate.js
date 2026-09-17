@@ -149,6 +149,58 @@ export function uppercaseSchemaTypes(schema) {
   return copy;
 }
 
+// Gemini 3.x's thinkingLevel is a SMALL, CLOSED enum. Confirmed via repeated
+// live 400s from multiple independent callers (Hermes sending OpenAI-style
+// "none", Claude Code sending mismatched-case or exotic shapes like
+// "adaptive") that NOTHING outside this set is ever accepted:
+const GEMINI3_VALID_THINKING_LEVELS = ["minimal", "low", "medium", "high"];
+
+// Common cross-ecosystem aliases that mean "turn thinking off/as low as
+// possible" - mapped to Gemini's lowest level instead of passed through raw.
+const THINKING_OFF_ALIASES = ["none", "off", "disabled", "false", "0"];
+
+/**
+ * Single shared source of truth (used by BOTH this file's OpenAI-facing
+ * translator AND anthropicTranslate.js's Anthropic-facing translator) for
+ * turning ANY raw thinking-effort signal into something Gemini 3.x will
+ * actually accept - PROACTIVELY, before it ever reaches Google, instead of
+ * reactively discovering it's invalid via a live 400. This function is the
+ * fix for a recurring class of bug: two independent translation layers each
+ * had their own partial, ad-hoc handling of this same concept (case
+ * normalization here, a request-retry-on-400 fallback there), and each
+ * still had gaps a different caller could hit.
+ *
+ * @param {string|null|undefined} rawValue Caller-supplied effort string
+ *   (e.g. an OpenAI-style reasoning_effort, or an approximated level from
+ *   Anthropic's budget_tokens). May be missing, mis-cased, or a value from
+ *   an entirely different ecosystem's convention.
+ * @param {string|null|undefined} defaultThinking The model row's own
+ *   configured default_thinking (set at model-registration time).
+ * @returns {string|null} A value guaranteed to be one of
+ *   GEMINI3_VALID_THINKING_LEVELS, or null if there is truly nothing usable
+ *   (caller should omit thinkingConfig entirely in that case, NOT send null).
+ */
+export function resolveGemini3ThinkingLevel(rawValue, defaultThinking) {
+  const norm = (v) => (typeof v === "string" ? v.trim().toLowerCase() : "");
+  const raw = norm(rawValue);
+
+  if (THINKING_OFF_ALIASES.includes(raw)) return "minimal";
+  if (GEMINI3_VALID_THINKING_LEVELS.includes(raw)) return raw;
+
+  // Raw value missing or unrecognized (typo, a future client shape we
+  // haven't seen, a completely foreign convention like Hermes' "none")
+  // - silently fall back to the model's own configured default, itself
+  // normalized the same way so a bad DB value can't cause a second failure.
+  const fallback = norm(defaultThinking);
+  if (THINKING_OFF_ALIASES.includes(fallback)) return "minimal";
+  if (GEMINI3_VALID_THINKING_LEVELS.includes(fallback)) return fallback;
+
+  // Genuinely nothing usable anywhere - omit thinkingConfig entirely rather
+  // than send a guaranteed-invalid value; Gemini uses its own internal
+  // default for the model in that case.
+  return null;
+}
+
 /**
  * Translates an OpenAI-compatible request body to a Google Native GenerateContent request.
  * 
@@ -383,29 +435,26 @@ export function translateRequestToNative(openAiBody, { modelName, defaultThinkin
         ? openAiBody.reasoning.effort
         : null);
 
-  const effortToApply = explicitTopLevelEffort || defaultThinking || null;
-
-  if (effortToApply) {
-    const normEffort = effortToApply.toLowerCase();
+  if (explicitTopLevelEffort || defaultThinking) {
     const isGemini3 = /gemini-3/i.test(modelName);
     const isGemini25 = /gemini-2\.5/i.test(modelName);
 
     if (isGemini3) {
-      // Maps to thinkingLevel: "minimal", "low", "medium", "high"
-      genConfig.thinkingConfig = {
-        thinkingLevel: normEffort
-      };
+      const level = resolveGemini3ThinkingLevel(explicitTopLevelEffort, defaultThinking);
+      if (level) genConfig.thinkingConfig = { thinkingLevel: level };
+      // level === null -> omit thinkingConfig entirely, never send an invalid value
     } else if (isGemini25) {
-      // Maps to thinkingBudget in tokens
+      const normEffort = (explicitTopLevelEffort || defaultThinking || "").toLowerCase();
       let budget = 0;
       if (normEffort === "high" || normEffort === "medium") {
         budget = 2048;
       } else if (normEffort === "low" || normEffort === "minimal") {
         budget = 1024;
       }
-      genConfig.thinkingConfig = {
-        thinkingBudget: budget
-      };
+      // any other string (including "none") safely falls to budget=0 -
+      // Gemini 2.5's thinkingBudget is a plain number, not a closed enum,
+      // so this branch never had the "invalid enum value" failure mode.
+      genConfig.thinkingConfig = { thinkingBudget: budget };
     }
   }
 
