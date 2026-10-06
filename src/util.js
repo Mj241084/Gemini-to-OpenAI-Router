@@ -113,7 +113,7 @@ export function isAuthorizedAnthropicStyle(request, expectedToken) {
 const CORS_HEADERS = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET, POST, PATCH, DELETE, OPTIONS",
-  "access-control-allow-headers": "authorization, content-type, x-api-key, anthropic-version",
+  "access-control-allow-headers": "authorization, content-type, x-api-key, anthropic-version, x-goog-api-key, x-goog-api-client, x-goog-user-project",
 };
 
 export function json(data, status = 200, extraHeaders = {}) {
@@ -226,4 +226,48 @@ export function pcmToWavBase64(base64Pcm, sampleRate = 24000, numChannels = 1, b
   wavBytes.set(header, 0);
   wavBytes.set(pcmBytes, header.length);
   return bytesToBase64(wavBytes);
+}
+
+// ---------------------------------------------------------------------------
+// Google native (Gemini API) surface helpers
+// ---------------------------------------------------------------------------
+
+export function extractGoogleApiKey(request) {
+  const h = request.headers.get("x-goog-api-key");
+  if (h && h.trim()) return h.trim();
+  try {
+    const k = new URL(request.url).searchParams.get("key");
+    if (k && k.trim()) return k.trim();
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+// Accepts the token from any of: x-goog-api-key, ?key=, x-api-key, Authorization: Bearer.
+export function isAuthorizedGoogleStyle(request, expectedToken) {
+  if (!expectedToken) return false;
+  const candidates = [extractGoogleApiKey(request), extractApiKeyHeader(request), extractBearerToken(request)].filter(Boolean);
+  return candidates.some((c) => timingSafeEqual(c, expectedToken));
+}
+
+const GOOGLE_STATUS_NAMES = {
+  400: "INVALID_ARGUMENT",
+  401: "UNAUTHENTICATED",
+  403: "PERMISSION_DENIED",
+  404: "NOT_FOUND",
+  429: "RESOURCE_EXHAUSTED",
+  500: "INTERNAL",
+  501: "UNIMPLEMENTED",
+  502: "UNAVAILABLE",
+  503: "UNAVAILABLE",
+  504: "DEADLINE_EXCEEDED",
+};
+
+// Google's error envelope: {"error":{"code":..,"message":..,"status":".."}}
+export function googleError(message, status = 400, statusName) {
+  return json(
+    { error: { code: status, message, status: statusName || GOOGLE_STATUS_NAMES[status] || "UNKNOWN" } },
+    status
+  );
 }

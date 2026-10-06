@@ -30,7 +30,21 @@ import {
   extractApiKeyHeader,
   isAuthorizedAnthropicStyle,
   anthropicError,
+  isAuthorizedGoogleStyle,
+  googleError,
 } from "./util.js";
+import {
+  parseGoogleNativePath,
+  parseGoogleModelsPath,
+  detectKind,
+  buildUpstreamUrl,
+  rewriteModelFields,
+  normalizeThinking,
+  ensureThoughtSignatures as ensureGoogleNativeThoughtSignatures,
+  extractUsageFromText,
+  extractUsageFromSseStream,
+  stripModelsPrefix,
+} from "./googleNative.js";
 
 export { RouterDO };
 
@@ -120,6 +134,40 @@ export default {
           return anthropicError("Unauthorized: missing or invalid x-api-key.", 401, "authentication_error");
         }
         return await handleAnthropicMessages(request, env, ctx);
+      }
+
+      // ---------------------------------------------------------------
+      // Google native (Gemini API) surface - pure passthrough, see
+      // src/googleNative.js. Upstream is always v1beta.
+      // ---------------------------------------------------------------
+      const googleRoute = request.method === "POST" ? parseGoogleNativePath(path) : null;
+      if (googleRoute) {
+        if (!isAuthorizedGoogleStyle(request, env.PROXY_TOKEN)) {
+          return googleError("API key not valid. Please pass a valid API key.", 401, "UNAUTHENTICATED");
+        }
+        return await handleGoogleNative(request, env, ctx, googleRoute);
+      }
+
+      const googleModelsRoute = request.method === "GET" ? parseGoogleModelsPath(path) : null;
+      if (googleModelsRoute) {
+        if (!isAuthorizedGoogleStyle(request, env.PROXY_TOKEN)) {
+          return googleError("API key not valid. Please pass a valid API key.", 401, "UNAUTHENTICATED");
+        }
+        return await handleGoogleModels(env, googleModelsRoute.name);
+      }
+
+      // Anything else under /v1beta/ (Files, cachedContents, tunedModels, Live, batches...)
+      // is intentionally unsupported: those resources are bound to the client's own
+      // API key and are incompatible with key rotation.
+      if (path.startsWith("/v1beta/")) {
+        if (!isAuthorizedGoogleStyle(request, env.PROXY_TOKEN)) {
+          return googleError("API key not valid. Please pass a valid API key.", 401, "UNAUTHENTICATED");
+        }
+        return googleError(
+          "This endpoint is not supported by the router (only generateContent, streamGenerateContent, countTokens, embedContent, batchEmbedContents and model listing).",
+          501,
+          "UNIMPLEMENTED"
+        );
       }
 
       // ---------------------------------------------------------------
@@ -1248,4 +1296,261 @@ async function isTransientGoogleError(respClone) {
 // lowercase-normalized) instead of whatever produced the rejected value.
 function isUnsupportedThinkingLevelError(errText) {
   return /thinking level\s+\S+\s+is not supported/i.test(errText || "");
+}
+
+// ===========================================================================
+// Google native (Gemini API) passthrough
+// ===========================================================================
+
+export async function handleGoogleNative(request, env, ctx, route) {
+  const { action, model: urlModel } = route;
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return googleError("Request body must be valid JSON.", 400, "INVALID_ARGUMENT");
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return googleError("Request body must be a JSON object.", 400, "INVALID_ARGUMENT");
+  }
+
+  const kind = detectKind(action, body);
+  const requestedModel = (urlModel || "").trim() || "auto";
+  const searchParams = new URL(request.url).searchParams;
+  const isStream = action === "streamGenerateContent";
+  const isSse = isStream && searchParams.get("alt") === "sse";
+
+  if (action === "generateContent" || action === "streamGenerateContent") {
+    ensureGoogleNativeThoughtSignatures(body);
+  }
+
+  const stub = getStub(env);
+  const excludePairs = [];
+  let lastErrorPayload = null;
+  let lastErrorStatus = 502;
+  let rawBody = null; // serialized once when the body is unchanged between attempts
+
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    const candidate = await stub.pickCandidate({ requestedModel, excludePairs, kind });
+
+    if (!candidate) {
+      const status = await stub.getStatus();
+      const msg = buildExhaustionMessage(status);
+      ctx.waitUntil(
+        sendOwnerAlert(env, `🚨 <b>همه‌ی مدل‌ها/کلیدها exhausted شدن (Google native)</b>\n${escapeHtmlAlert(msg)}`)
+      );
+      return googleError(msg, 429, "RESOURCE_EXHAUSTED");
+    }
+
+    if (candidate.provider !== "google") {
+      excludePairs.push(`model:${candidate.modelId}`);
+      continue;
+    }
+
+    const fail = (httpStatus, errorMessage, scope) =>
+      ctx.waitUntil(
+        stub.reportFailure({ keyId: candidate.keyId, modelId: candidate.modelId, httpStatus, errorMessage, scope })
+      );
+
+    const attemptBody = normalizeThinking(rewriteModelFields(action, body, candidate.modelName), {
+      modelName: candidate.modelName,
+      defaultThinking: candidate.defaultThinking,
+    });
+    let payload;
+    if (attemptBody === body) {
+      if (rawBody === null) rawBody = JSON.stringify(body);
+      payload = rawBody;
+    } else {
+      payload = JSON.stringify(attemptBody);
+    }
+    const url = buildUpstreamUrl({ modelName: candidate.modelName, action, searchParams });
+
+    const startedAt = Date.now();
+    let upstreamResp;
+    try {
+      upstreamResp = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-goog-api-key": candidate.apiKey },
+        body: payload,
+        signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS),
+      });
+    } catch (networkErr) {
+      excludePairs.push(`model:${candidate.modelId}`);
+      fail(0, `network error: ${networkErr.message || networkErr}`, "model");
+      lastErrorPayload = String(networkErr.message || networkErr);
+      lastErrorStatus = 502;
+      continue;
+    }
+
+    // 429 -> rotate key
+    if (upstreamResp.status === 429) {
+      const errText = await safeReadText(upstreamResp);
+      excludePairs.push(`${candidate.keyId}:${candidate.modelId}`);
+      fail(429, errText, "key");
+      lastErrorPayload = errText;
+      lastErrorStatus = 429;
+      continue;
+    }
+
+    // 502/503/504/524 or transient 500 -> rotate model
+    const isTransient500 = upstreamResp.status === 500 && (await isTransientGoogleError(upstreamResp.clone()));
+    if ([502, 503, 504, 524].includes(upstreamResp.status) || isTransient500) {
+      const errText = await safeReadText(upstreamResp);
+      excludePairs.push(`model:${candidate.modelId}`);
+      fail(upstreamResp.status, errText, "model");
+      lastErrorPayload = errText;
+      lastErrorStatus = upstreamResp.status;
+      continue;
+    }
+
+    // 400 -> fail fast, raw Google body straight to the client
+    if (upstreamResp.status === 400) {
+      const errText = await safeReadText(upstreamResp);
+      fail(400, errText, "none");
+      ctx.waitUntil(
+        sendOwnerAlert(
+          env,
+          `🚨 <b>خطای ۴۰۰ (Google native، بدون retry)</b>\nمدل: ${candidate.modelName}\nکلید: ${candidate.keyLabel || "-"}\n<code>${escapeHtmlAlert(errText.slice(0, 600))}</code>`
+        )
+      );
+      return withCors(
+        new Response(
+          errText || JSON.stringify({ error: { code: 400, message: "Bad request", status: "INVALID_ARGUMENT" } }),
+          { status: 400, headers: { "content-type": "application/json; charset=utf-8" } }
+        )
+      );
+    }
+
+    // 401/403 -> rotate key
+    if (upstreamResp.status === 401 || upstreamResp.status === 403) {
+      const errText = await safeReadText(upstreamResp);
+      excludePairs.push(`${candidate.keyId}:${candidate.modelId}`);
+      fail(upstreamResp.status, errText, "key");
+      lastErrorPayload = errText;
+      lastErrorStatus = upstreamResp.status;
+      continue;
+    }
+
+    // any other non-OK -> raw passthrough (status + body)
+    if (!upstreamResp.ok) {
+      const errText = await safeReadText(upstreamResp);
+      fail(upstreamResp.status, errText, "none");
+      ctx.waitUntil(
+        sendOwnerAlert(
+          env,
+          `🚨 <b>خطای HTTP ${upstreamResp.status} (Google native)</b>\nمدل: ${candidate.modelName}\n<code>${escapeHtmlAlert(errText.slice(0, 600))}</code>`
+        )
+      );
+      return withCors(
+        new Response(errText, {
+          status: upstreamResp.status,
+          headers: { "content-type": upstreamResp.headers.get("content-type") || "application/json; charset=utf-8" },
+        })
+      );
+    }
+
+    // ---- success ----
+    const latencyMs = Date.now() - startedAt;
+    const reportOk = (usage) =>
+      stub.reportSuccess({
+        keyId: candidate.keyId,
+        modelId: candidate.modelId,
+        promptTokens: kind === "embedding" ? null : usage?.promptTokens ?? null,
+        completionTokens: kind === "embedding" ? null : usage?.completionTokens ?? null,
+        totalTokens: kind === "embedding" ? null : usage?.totalTokens ?? null,
+        latencyMs,
+      });
+
+    if (isStream) {
+      const streamHeaders = new Headers();
+      streamHeaders.set("content-type", upstreamResp.headers.get("content-type") || "text/event-stream");
+      streamHeaders.set("cache-control", "no-cache");
+
+      if (isSse && upstreamResp.body) {
+        const [clientStream, logStream] = upstreamResp.body.tee();
+        ctx.waitUntil(
+          (async () => {
+            let usage = null;
+            try {
+              usage = await extractUsageFromSseStream(logStream);
+            } finally {
+              try {
+                await reportOk(usage);
+              } catch {
+                // ignore
+              }
+            }
+          })()
+        );
+        return withCors(new Response(clientStream, { status: 200, headers: streamHeaders }));
+      }
+
+      // non-SSE stream (JSON array chunks): pass through untouched, usage unknown
+      ctx.waitUntil(reportOk(null));
+      return withCors(new Response(upstreamResp.body, { status: 200, headers: streamHeaders }));
+    }
+
+    // non-stream: return the EXACT upstream text (no re-serialize)
+    const text = await upstreamResp.text();
+    ctx.waitUntil(reportOk(extractUsageFromText(text)));
+    return withCors(
+      new Response(text, {
+        status: 200,
+        headers: { "content-type": upstreamResp.headers.get("content-type") || "application/json; charset=UTF-8" },
+      })
+    );
+  }
+
+  ctx.waitUntil(
+    sendOwnerAlert(
+      env,
+      `🚨 <b>تمام ${MAX_ATTEMPTS} تلاش ناموفق بود (Google native)</b>\nآخرین خطا (HTTP ${lastErrorStatus}):\n<code>${escapeHtmlAlert(
+        String(lastErrorPayload || "unknown").slice(0, 600)
+      )}</code>`
+    )
+  );
+  return googleError(
+    `All retry attempts were exhausted. Last upstream error: ${lastErrorPayload || "unknown"}`,
+    lastErrorStatus >= 400 ? lastErrorStatus : 502
+  );
+}
+
+function googleModelObject(id, displayName, methods) {
+  return {
+    name: `models/${id}`,
+    baseModelId: id,
+    version: "router",
+    displayName,
+    description: displayName,
+    supportedGenerationMethods: methods,
+  };
+}
+
+const GOOGLE_METHODS_BY_KIND = {
+  chat: ["generateContent", "streamGenerateContent", "countTokens"],
+  embedding: ["embedContent", "batchEmbedContents"],
+  tts: ["generateContent"],
+};
+
+export async function handleGoogleModels(env, name) {
+  const stub = getStub(env);
+  const models = await stub.listModels();
+  const chat = GOOGLE_METHODS_BY_KIND.chat;
+  const items = [
+    googleModelObject("auto", "auto (default fallback order)", chat),
+    googleModelObject("fast", "fast (speed-first fallback order)", chat),
+    googleModelObject("stable", "stable (stability-first fallback order)", chat),
+    ...models
+      .filter((m) => m.enabled)
+      .sort((a, b) => a.order_num - b.order_num)
+      .map((m) => googleModelObject(m.name, m.name, GOOGLE_METHODS_BY_KIND[m.kind || "chat"] || chat)),
+  ];
+
+  if (!name) return json({ models: items });
+
+  const wanted = stripModelsPrefix(name);
+  const found = items.find((i) => i.baseModelId === wanted);
+  if (!found) return googleError(`models/${wanted} is not found.`, 404, "NOT_FOUND");
+  return json(found);
 }
