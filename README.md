@@ -11,12 +11,14 @@
 ## ۱) معماری خیلی خلاصه
 
 ```
-Caller (Hermes / gemini-personal-agent / ...)
+Caller (Hermes / gemini-personal-agent / Claude Code / Google GenAI SDKs / ...)
         │
-        ▼  (OpenAI-compatible request)
+        ▼
    این Worker
         │
         ├─ /v1/chat/completions  ──▶ کلید+مدل انتخاب‌شده ──▶ Google AI Studio یا OpenRouter
+        ├─ /v1/messages          ──▶ کلید+مدل انتخاب‌شده ──▶ Google AI Studio (Anthropic Bridge)
+        ├─ /v1beta/models/*      ──▶ کلید+مدل انتخاب‌شده ──▶ Google Native passthrough
         ├─ /v1/embeddings        ──▶ کلید+مدل انتخاب‌شده ──▶ Google Native embedContent
         │
         ▼
@@ -311,6 +313,51 @@ claude
 
 ---
 
+## ۶.۲) اتصال از Google Native (SDKها و Gemini CLI)
+
+روتر علاوه بر OpenAI و Anthropic، فرمت بومی **Gemini API** را هم به‌صورت passthrough می‌پذیرد
+(بدون ترجمه). می‌توانی SDKهای رسمی گوگل را به روتر وصل کنی و از چرخش کلید، fallback مدل،
+rate-limit و circuit breaker روتر استفاده کنی.
+
+مسیرهای پشتیبانی‌شده: `:generateContent`، `:streamGenerateContent`، `:countTokens`،
+`:embedContent`، `:batchEmbedContents` (با `/v1beta/` یا `/v1/`) و `GET /v1beta/models`.
+احراز هویت با `PROXY_TOKEN` از طریق `x-goog-api-key` یا `?key=` یا `Authorization: Bearer`.
+نام مدل می‌تواند `auto` / `fast` / `stable` یا نام دقیق یک مدل باشد.
+
+```js
+// Node
+import { GoogleGenAI } from "@google/genai";
+const ai = new GoogleGenAI({ apiKey: "<PROXY_TOKEN>", httpOptions: { baseUrl: "https://<your-worker>.workers.dev" } });
+const r = await ai.models.generateContent({ model: "auto", contents: "سلام" });
+```
+
+```python
+# Python
+from google import genai
+from google.genai import types
+client = genai.Client(api_key="<PROXY_TOKEN>", http_options=types.HttpOptions(base_url="https://<your-worker>.workers.dev"))
+print(client.models.generate_content(model="auto", contents="سلام").text)
+```
+
+```bash
+# curl
+curl "https://<your-worker>.workers.dev/v1beta/models/auto:generateContent" \
+  -H "x-goog-api-key: <PROXY_TOKEN>" -H "Content-Type: application/json" \
+  -d '{"contents":[{"role":"user","parts":[{"text":"سلام"}]}]}'
+```
+
+**ریزه‌کاری‌ها:**
+- نوع مدل (`chat` / `embedding` / `tts`) از روی اکشن و `responseModalities` تشخیص داده می‌شود.
+- فیلد `model` داخل بدنه‌ی `embedContent`، `batchEmbedContents` و `countTokens` با مدل انتخاب‌شده هم‌خوان می‌شود.
+- `thinkingLevel` نامعتبر روی Gemini 3.x اصلاح می‌شود، ولی اگر کلاینت `thinkingConfig` نفرستد چیزی تزریق نمی‌شود.
+- برای `functionCall`های بدون `thoughtSignature`، مقدار sentinel گوگل گذاشته می‌شود.
+- پارامتر `key` کلاینت هرگز به گوگل فوروارد نمی‌شود.
+
+**پشتیبانی‌نشده** (پاسخ `501`): Files API، `cachedContents`، tuned models، Live API (WebSocket)، batch jobs.
+دلیل: این منابع به API key خودِ کلاینت وابسته‌اند و با چرخش کلید سازگار نیستند.
+
+---
+
 ## ۷) TTS — چرا از مسیر بومی گوگل رد می‌شه
 
 نسخه‌ی اول این پروژه TTS رو از همون لایه‌ی OpenAI-compat (`modalities: ["text","audio"]`)
@@ -468,7 +515,7 @@ overwrite کنه. نیازی به کار اضافه نیست.
 - بازه‌ی ریست روزانه (۱۲:۳۰ ظهر ایران) در `getIranDayWindow` قابل ویرایشه اگه سهمیه‌ی
   واقعی گوگل زمان دیگه‌ای ریست بشه.
 - روی خطای ۴۰۰، Worker عمداً retry نمی‌کنه.
-- فقط `/v1/chat/completions`، `/v1/embeddings`، `/v1/models`، `/v1/messages` و `/v1/messages/count_tokens` پیاده‌سازی شده‌اند.
+- فقط `/v1/chat/completions`، `/v1/embeddings`، `/v1/models`، `/v1/messages`، `/v1/messages/count_tokens` و مسیرهای Google native (`/v1beta/models/*:{generateContent,streamGenerateContent,countTokens,embedContent,batchEmbedContents}`) پیاده‌سازی شده‌اند.
 - تبدیل schema ابزارها (`src/nativeTranslate.js`) بر پایه‌ی یک **allowlist قطعی** از
   فیلدهای تاییدشده‌ی Gemini Schema است، نه blocklist — هر کلید JSON-Schema که در
   این allowlist نباشه بی‌سروصدا drop می‌شه (نه ۴۰۰). جزئیات کامل در
