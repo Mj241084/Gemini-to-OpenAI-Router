@@ -19,7 +19,6 @@ import {
   DEFAULT_KIND,
   MODEL_FAIL_THRESHOLD,
   MODEL_UNAVAILABLE_COOLDOWN_MS,
-  USAGE_STATE_FLUSH_INTERVAL_MS,
   LOG_PRUNE_CHECK_INTERVAL,
 } from "./config.js";
 
@@ -123,10 +122,7 @@ export class RouterDO extends DurableObjectBase {
         }
       }
       await this._reloadAllCaches();
-      const currentAlarm = await this.ctx.storage.getAlarm();
-      if (currentAlarm === null) {
-        await this.ctx.storage.setAlarm(Date.now() + USAGE_STATE_FLUSH_INTERVAL_MS);
-      }
+      await this.ctx.storage.deleteAlarm?.();
     });
   }
 
@@ -139,6 +135,26 @@ export class RouterDO extends DurableObjectBase {
     }
     const countRow = rowsOf(this.ctx.storage.sql.exec(`SELECT COUNT(*) as c FROM logs`))[0];
     this.logCount = countRow ? countRow.c : 0;
+  }
+
+  _persistUsageState(state) {
+    this.ctx.storage.sql.exec(
+      `INSERT INTO usage_state (key_id, model_id, minute_window, minute_count, day_window, day_count, cooldown_until, last_used_at)
+       VALUES (?,?,?,?,?,?,?,?)
+       ON CONFLICT(key_id, model_id) DO UPDATE SET
+         minute_window=excluded.minute_window, minute_count=excluded.minute_count,
+         day_window=excluded.day_window, day_count=excluded.day_count,
+         cooldown_until=excluded.cooldown_until, last_used_at=excluded.last_used_at`,
+      state.key_id, state.model_id, state.minute_window, state.minute_count,
+      state.day_window, state.day_count, state.cooldown_until, state.last_used_at
+    );
+  }
+
+  _persistModelBreaker(model) {
+    this.ctx.storage.sql.exec(
+      `UPDATE models SET fail_streak=?, unavailable_until=? WHERE id=?`,
+      model.fail_streak || 0, model.unavailable_until || 0, model.id
+    );
   }
 
   // -------------------------------------------------------------------
@@ -554,24 +570,30 @@ export class RouterDO extends DurableObjectBase {
     state.day_count = newDayCount;
     state.last_used_at = now;
 
-    // A success means the model has recovered - clear the circuit breaker.
+    this._persistUsageState(state);
+
     const model = this.modelsCache.find((m) => m.id === modelId);
-    if (model) {
+    if (model && (model.fail_streak || model.unavailable_until)) {
       model.fail_streak = 0;
       model.unavailable_until = 0;
+      this._persistModelBreaker(model);
     }
 
     const key = this._cachedKeyById(keyId);
-    this._insertLog({
-      modelName: model?.name,
-      keyLabel: key?.label,
-      status: "success",
-      httpStatus: 200,
-      promptTokens,
-      completionTokens,
-      totalTokens,
-      latencyMs,
-    });
+    try {
+      this._insertLog({
+        modelName: model?.name,
+        keyLabel: key?.label,
+        status: "success",
+        httpStatus: 200,
+        promptTokens,
+        completionTokens,
+        totalTokens,
+        latencyMs,
+      });
+    } catch {
+      // ignore log failure
+    }
     return { ok: true };
   }
 
@@ -602,12 +624,8 @@ export class RouterDO extends DurableObjectBase {
         state.minute_count = 999999;
         state.cooldown_until = nextMinuteStart;
       }
+      this._persistUsageState(state);
     } else if (scope === "model" && modelId) {
-      // Circuit breaker: count consecutive model-level failures (502/503/
-      // 504/network error). After MODEL_FAIL_THRESHOLD in a row, take the
-      // model out of rotation for MODEL_UNAVAILABLE_COOLDOWN_MS so future
-      // requests skip it immediately instead of re-discovering the outage
-      // via a fresh round trip every time.
       const model = this.modelsCache.find((m) => m.id === modelId);
       if (model) {
         const newStreak = (model.fail_streak || 0) + 1;
@@ -617,17 +635,22 @@ export class RouterDO extends DurableObjectBase {
         } else {
           model.fail_streak = newStreak;
         }
+        this._persistModelBreaker(model);
       }
     }
     const model = modelId ? this._cachedModelById(modelId) : null;
     const key = keyId ? this._cachedKeyById(keyId) : null;
-    this._insertLog({
-      modelName: model?.name,
-      keyLabel: key?.label,
-      status: "error",
-      httpStatus,
-      errorMessage,
-    });
+    try {
+      this._insertLog({
+        modelName: model?.name,
+        keyLabel: key?.label,
+        status: "error",
+        httpStatus,
+        errorMessage,
+      });
+    } catch {
+      // ignore log failure
+    }
     return { ok: true };
   }
 
@@ -750,36 +773,8 @@ export class RouterDO extends DurableObjectBase {
     return result;
   }
 
-  async _periodicFlush() {
-    for (const state of this.usageState.values()) {
-      this.ctx.storage.sql.exec(
-        `INSERT INTO usage_state (key_id, model_id, minute_window, minute_count, day_window, day_count, cooldown_until, last_used_at)
-         VALUES (?,?,?,?,?,?,?,?)
-         ON CONFLICT(key_id, model_id) DO UPDATE SET
-           minute_window=excluded.minute_window, minute_count=excluded.minute_count,
-           day_window=excluded.day_window, day_count=excluded.day_count,
-           cooldown_until=excluded.cooldown_until, last_used_at=excluded.last_used_at`,
-        state.key_id, state.model_id, state.minute_window, state.minute_count,
-        state.day_window, state.day_count, state.cooldown_until, state.last_used_at
-      );
-    }
-    for (const model of this.modelsCache) {
-      this.ctx.storage.sql.exec(
-        `UPDATE models SET fail_streak=?, unavailable_until=? WHERE id=?`,
-        model.fail_streak,
-        model.unavailable_until,
-        model.id
-      );
-    }
-  }
-
   async alarm() {
-    try {
-      await this._periodicFlush();
-    } catch (err) {
-      this._insertLog({ status: "error", errorMessage: `periodic flush failed: ${err.message || err}` });
-    }
-    await this.ctx.storage.setAlarm(Date.now() + USAGE_STATE_FLUSH_INTERVAL_MS);
+    // No-op for legacy scheduled alarms in live deployments
   }
 }
 
