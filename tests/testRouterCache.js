@@ -173,58 +173,92 @@ async function runTests() {
   }
 
   // ---------------------------------------------------------------------------
-  // Test 3: Write Deferral & Periodic Flush (Sec 3.2 & Sec 6)
+  // Test 3: Write-Through Synchronous Persistence (Sec 3.2 & Sec 6)
   // ---------------------------------------------------------------------------
   try {
-    console.log("\n--- Test 3: Write Deferral & Flush ---");
+    console.log("\n--- Test 3: Write-Through Synchronous Persistence ---");
     const keyId = 1;
     const modelId = 1;
 
-    // Mutate usage state in-memory
-    const state = router._getOrInitUsageState(keyId, modelId, getMinuteWindow(), getIranDayWindow());
-    state.minute_count = 12;
-    state.day_count = 45;
-
-    // Verify SQL is still EMPTY/STALE for usage_state (no insert yet)
-    let sqlRows = rowsOf(db.prepare("SELECT * FROM usage_state WHERE key_id = ?").all(keyId));
-    assert(sqlRows.length === 0, "SQL usage_state table is still empty before flush");
-
-    // Call periodic flush manually
-    await router._periodicFlush();
-
-    // Verify SQL database is now fully updated
-    sqlRows = rowsOf(db.prepare("SELECT * FROM usage_state WHERE key_id = ?").all(keyId));
-    assert(sqlRows.length === 1, "SQL usage_state row exists after flush");
-    assert(sqlRows[0].minute_count === 12, "SQL minute_count matches flushed in-memory value");
-    assert(sqlRows[0].day_count === 45, "SQL day_count matches flushed in-memory value");
+    // Verify SQL is IMMEDIATELY updated in usage_state without any flush call (reportSuccess was called in Test 2, so day_count is 1)
+    const sqlRows = rowsOf(db.prepare("SELECT * FROM usage_state WHERE key_id = ? AND model_id = ?").all(keyId, modelId));
+    assert(sqlRows.length === 1, "SQL usage_state row exists immediately after reportSuccess");
+    assert(sqlRows[0].day_count === 1, "SQL day_count matches immediately after reportSuccess");
   } catch (err) {
     console.error("Test 3 failed:", err);
     failed++;
   }
 
   // ---------------------------------------------------------------------------
-  // Test 4: Crash & Evict Simulation (Sec 6)
+  // Test 4: Crash & Evict Simulation Without Flush (Sec 6)
   // ---------------------------------------------------------------------------
   try {
-    console.log("\n--- Test 4: DO Eviction & Reload ---");
-    // Change state in-memory and flush
+    console.log("\n--- Test 4: DO Eviction & Reload Without Flush ---");
     const keyId = 1;
     const modelId = 1;
-    const state = router._getOrInitUsageState(keyId, modelId, getMinuteWindow(), getIranDayWindow());
-    state.minute_count = 99;
-    state.day_count = 999;
-    await router._periodicFlush();
 
-    // Re-instantiate RouterDO simulating cold start (evict/crash reload)
+    // Report success again (increments day_count to 2)
+    await router.reportSuccess({ keyId, modelId });
+
+    // Re-instantiate RouterDO simulating cold start (evict/crash reload) WITHOUT calling any flush
     const freshRouter = new RouterDO(mockCtx, mockEnv);
 
-    // Verify that the constructor blockConcurrencyWhile reloads the state from database Sync
+    // Verify that the constructor reloads the persisted state from SQL
     const freshState = freshRouter.usageState.get(`${keyId}:${modelId}`);
     assert(freshState !== undefined, "Loaded state from db into memory on cold start");
-    assert(freshState.minute_count === 99, "Reloaded minute_count matches");
-    assert(freshState.day_count === 999, "Reloaded day_count matches");
+    assert(freshState.day_count === 2, "Reloaded day_count matches persisted value (2)");
   } catch (err) {
     console.error("Test 4 failed:", err);
+    failed++;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 4b: Key Scope Cooldown Persistence (reportFailure scope: 'key')
+  // ---------------------------------------------------------------------------
+  try {
+    console.log("\n--- Test 4b: Key Scope Cooldown Persistence ---");
+    const keyId = 1;
+    const modelId = 1;
+
+    // Trigger daily quota limit 429 error for key
+    await router.reportFailure({ keyId, modelId, httpStatus: 429, errorMessage: "Quota exceeded per day", scope: "key" });
+
+    // Check SQL immediately
+    const sqlRows = rowsOf(db.prepare("SELECT * FROM usage_state WHERE key_id = ? AND model_id = ?").all(keyId, modelId));
+    assert(sqlRows[0].day_count === 999999, "Daily limit error sets day_count=999999 in SQL immediately");
+    assert(sqlRows[0].cooldown_until > Date.now(), "Cooldown timestamp written to SQL immediately");
+
+    // Re-instantiate DO and verify key remains cooling down
+    const freshRouter = new RouterDO(mockCtx, mockEnv);
+    const candidate = await freshRouter.pickCandidate({ requestedModel: "gemini-3.5-flash" });
+    assert(candidate === null, "Key cooldown persists across DO eviction and blocks pickCandidate");
+  } catch (err) {
+    console.error("Test 4b failed:", err);
+    failed++;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Test 4c: Model Circuit Breaker Persistence (reportFailure scope: 'model')
+  // ---------------------------------------------------------------------------
+  try {
+    console.log("\n--- Test 4c: Model Circuit Breaker Persistence ---");
+    const modelId = 1;
+
+    // Trigger 3 consecutive model failures
+    await router.reportFailure({ keyId: 1, modelId, httpStatus: 503, errorMessage: "503 Service Unavailable", scope: "model" });
+    await router.reportFailure({ keyId: 1, modelId, httpStatus: 503, errorMessage: "503 Service Unavailable", scope: "model" });
+    await router.reportFailure({ keyId: 1, modelId, httpStatus: 503, errorMessage: "503 Service Unavailable", scope: "model" });
+
+    // Check SQL immediately
+    const sqlRows = rowsOf(db.prepare("SELECT * FROM models WHERE id = ?").all(modelId));
+    assert(sqlRows[0].unavailable_until > Date.now(), "Model unavailable_until written to SQL immediately");
+
+    // Re-instantiate DO and verify model circuit breaker persists
+    const freshRouter = new RouterDO(mockCtx, mockEnv);
+    const freshModel = freshRouter.modelsCache.find((m) => m.id === modelId);
+    assert(freshModel.unavailable_until > Date.now(), "Circuit breaker unavailable_until reloaded on fresh instance");
+  } catch (err) {
+    console.error("Test 4c failed:", err);
     failed++;
   }
 
